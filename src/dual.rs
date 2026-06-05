@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use crate::single::StringPod;
-use crate::storage::Storage;
+use crate::storage::{Storage, VariableInfo};
 
 /// Error returned by [`DualStringPod::try_from_columns`] when two columns
 /// cannot be fused into one [`DualStringPod`] without copying — i.e. they are
@@ -168,12 +168,12 @@ impl DualStringPod {
             positions.push((rel_start, rel_end));
         }
 
-        let storage = Storage::Variable {
+        let storage = Storage::Variable(VariableInfo {
             positions,
             head_skip: 0,
             tail_skip: 0,
             front_skip: 0,
-        };
+        });
         Ok(DualStringPod {
             seq: seq.data,
             qual: qual.data,
@@ -244,6 +244,21 @@ impl DualStringPod {
         )
     }
 
+    /// Both bytes of entry `i` at once.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    #[must_use]
+    pub fn pair_mut(&mut self, i: usize) -> Option<(&mut BStr, &mut BStr)> {
+        let r = self.storage.entry_range(i);
+        let seqs = Arc::get_mut(&mut self.seq)?;
+        let quals = Arc::get_mut(&mut self.qual)?;
+        Some((
+            seqs[r.start + self.seq_first_byte..r.end + self.seq_first_byte].as_bstr_mut(),
+            quals[r.start + self.qual_first_byte..r.end + self.qual_first_byte].as_bstr_mut(),
+        ))
+    }
+
     /// Mutable access to the sequence bytes of entry `i`, or `None` if the
     /// sequence buffer is shared (Arc strong count > 1). Drop or release other
     /// references before retrying, or rebuild into a fresh pod.
@@ -291,16 +306,16 @@ impl DualStringPod {
         self.storage.current_stride().is_some()
     }
 
-    pub fn cut_start(&mut self, n: usize) {
+    pub fn cut_start(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
-        self.storage.cut_start(n_u32);
+        self.storage.cut_start(n_u32, conditional);
     }
 
-    pub fn cut_end(&mut self, n: usize) {
+    pub fn cut_end(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
-        self.storage.cut_end(n_u32);
+        //self.storage.cut_end(n_u32, conditional);
     }
-    
+
     /// Drop the first `n` entries from the view. O(1): a byte offset on
     /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
     pub fn pop_front(&mut self, n: usize) {
@@ -428,7 +443,7 @@ impl DualStringPod {
         if let Storage::FixedLength { visible_len, .. } = self.storage {
             let vl = visible_len as usize;
             if vl > n {
-                self.cut_end(vl - n);
+                self.cut_end(vl - n, None);
             }
             return self;
         }
@@ -872,12 +887,12 @@ impl DualStringPodAliasBuilder<'_> {
         DualStringPod {
             seq: Arc::clone(&self.source.seq),
             qual: Arc::clone(&self.source.qual),
-            storage: Storage::Variable {
+            storage: Storage::Variable(VariableInfo {
                 positions: self.positions,
                 head_skip: 0,
                 tail_skip: 0,
                 front_skip: 0,
-            },
+            }),
             seq_first_byte: 0,
             qual_first_byte: 0,
         }

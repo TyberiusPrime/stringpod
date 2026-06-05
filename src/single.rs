@@ -2,7 +2,7 @@ use bstr::{BStr, ByteSlice as _};
 use std::ops::Range;
 use std::sync::Arc;
 
-use crate::storage::Storage;
+use crate::storage::{Storage, VariableInfo};
 
 /// A single column of byte strings backed by one shared `Arc<[u8]>` and a
 /// columnar metadata layout. Once `finish()`ed by a builder, the byte buffer
@@ -112,9 +112,9 @@ impl StringPod {
     }
 
     /// Cut `n` bytes off the start of every entry. O(1).
-    pub fn cut_start(&mut self, n: usize) {
+    pub fn cut_start(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
-        self.storage.cut_start(n_u32);
+        self.storage.cut_start(n_u32, conditional);
     }
 
     /// Cut `n` bytes off the end of every entry. O(1).
@@ -601,12 +601,12 @@ impl StringPodAliasBuilder<'_> {
     pub fn finish(self) -> StringPod {
         StringPod {
             data: Arc::clone(&self.source.data),
-            storage: Storage::Variable {
+            storage: Storage::Variable (VariableInfo {
                 positions: self.positions,
                 head_skip: 0,
                 tail_skip: 0,
                 front_skip: 0,
-            },
+            }),
         }
     }
 }
