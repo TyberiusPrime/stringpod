@@ -44,7 +44,7 @@ jobs:
         run: nix develop .#deny --command cargo deny check advisories bans sources
 
       - name: Test
-        run: nix build .#test
+        run: nix build -L ".#test.x86_64-linux.${{ matrix.job }}"
 
   publish-crate:
     name: Publish to crates.io
