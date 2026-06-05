@@ -476,6 +476,36 @@ impl DualStringPod {
         bld.finish()
     }
 
+    /// Generalized per-entry resize. For each entry `i` (in order), invokes
+    /// `f(i, seq, qual)` with the entry's current visible sequence and quality
+    /// bytes. The closure returns:
+    ///
+    /// * `None` — leave the entry unchanged, or
+    /// * `Some((start, len))` — narrow the entry to `[start..start + len]`. The
+    ///   sub-range is relative to the entry's current visible bytes and **must
+    ///   lie within them** (`start + len <= seq.len()`, equivalently
+    ///   `qual.len()`); otherwise this panics.
+    ///
+    /// The single returned range applies to *both* columns, preserving the
+    /// structural `seq.len() == qual.len()` invariant. No bytes are copied —
+    /// only the shared metadata is rewritten — so the new region must fall
+    /// inside the old one. Promotes `FixedLength` → `Variable`.
+    pub fn resize<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, &BStr, &BStr) -> Option<(usize, usize)>,
+    {
+        let seq = &self.seq;
+        let qual = &self.qual;
+        let sf = self.seq_first_byte;
+        let qf = self.qual_first_byte;
+        self.storage.resize_positions(|i, start, stop| {
+            let (s, e) = (start as usize, stop as usize);
+            let seq_bytes = BStr::new(&seq[s + sf..e + sf]);
+            let qual_bytes = BStr::new(&qual[s + qf..e + qf]);
+            f(i, seq_bytes, qual_bytes)
+        });
+    }
+
     pub fn retain_by_bools(&mut self, keep: &[bool]) {
         self.storage.retain_by_bools(keep);
     }
@@ -1617,5 +1647,83 @@ mod tests {
         qual.drain(1..2); // entries "IIII"(0..4), "FFFF"(8..12)
         let err = DualStringPod::try_from_columns(seq, qual).unwrap_err();
         assert_eq!(err, ColumnError::NotATranslation);
+    }
+
+    #[test]
+    fn cut_start_conditional_after_pop_front_dual() {
+        // Regression: conditional cuts must honor front_skip on both columns.
+        let mut bld = DualStringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAAA"), b("vvvvv"));
+        bld.push(b("BBB"), b("www")); // unequal length → Variable storage
+        bld.push(b("CCCCC"), b("xxxxx"));
+        let mut p = bld.finish();
+        assert!(!p.is_fixed_length());
+        p.pop_front(1); // view: ("BBB","www"), ("CCCCC","xxxxx")
+        p.cut_start(2, Some(&[true, false]));
+        assert_eq!(p.pair(0), (BStr::new("B"), BStr::new("w")));
+        assert_eq!(p.pair(1), (BStr::new("CCCCC"), BStr::new("xxxxx")));
+    }
+
+    // ── resize ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_dual_per_entry_cut() {
+        let mut bld = DualStringPodBuilder::with_capacity(6, 3);
+        bld.push(b("HELLO!"), b("123456"));
+        bld.push(b("WORLD!"), b("ABCDEF"));
+        bld.push(b("RUST!!"), b("uvwxyz"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        // Cut each entry at a per-entry location: keep [i..i+2] in both columns.
+        p.resize(|i, _, _| Some((i, 2)));
+        assert!(!p.is_fixed_length()); // promoted
+        assert_eq!(p.pair(0), (BStr::new("HE"), BStr::new("12")));
+        assert_eq!(p.pair(1), (BStr::new("OR"), BStr::new("BC")));
+        assert_eq!(p.pair(2), (BStr::new("ST"), BStr::new("wx")));
+    }
+
+    #[test]
+    fn resize_dual_callback_sees_both_columns() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("FFFF####"));
+        bld.push(b("TTTT"), b("!!!!"));
+        let mut p = bld.finish();
+        // Quality-style trim: cut at first '#' in the quality string.
+        p.resize(|_, seq, qual| {
+            assert_eq!(seq.len(), qual.len());
+            let keep = qual.iter().position(|&c| c == b'#').unwrap_or(qual.len());
+            Some((0, keep))
+        });
+        assert_eq!(p.pair(0), (BStr::new("ACGT"), BStr::new("FFFF")));
+        assert_eq!(p.pair(1), (BStr::new("TTTT"), BStr::new("!!!!")));
+    }
+
+    #[test]
+    fn resize_dual_none_and_offsets() {
+        // A dual pod built from columns can carry non-zero first_byte offsets;
+        // resize must honor them and leave None entries untouched.
+        let mut bld = DualStringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAAA"), b("vvvvv"));
+        bld.push(b("BBBBB"), b("wwwww"));
+        bld.push(b("CCCCC"), b("xxxxx"));
+        let mut p = bld.finish();
+        p.cut_start(1, None); // visible: "AAAA"/"vvvv", etc. (head overlay)
+        p.resize(|i, s, q| {
+            assert_eq!(s.len(), 4);
+            assert_eq!(q.len(), 4);
+            if i == 1 { None } else { Some((1, 2)) }
+        });
+        assert_eq!(p.pair(0), (BStr::new("AA"), BStr::new("vv")));
+        assert_eq!(p.pair(1), (BStr::new("BBBB"), BStr::new("wwww"))); // untouched
+        assert_eq!(p.pair(2), (BStr::new("CC"), BStr::new("xx")));
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds visible length")]
+    fn resize_dual_out_of_range_panics() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 1);
+        bld.push(b("ACGT"), b("FFFF"));
+        let mut p = bld.finish();
+        p.resize(|_, _, _| Some((1, 5))); // 1+5 > 4
     }
 }

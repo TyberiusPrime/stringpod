@@ -1,3 +1,4 @@
+use bstr::BStr;
 use std::ops::Range;
 
 /// Columnar storage layout. Crate-private; pods and builders own one of these
@@ -133,36 +134,21 @@ impl Storage {
         r.end - r.start
     }
 
-    pub fn make_variable(&mut self) -> &mut VariableInfo {
-        match self {
-            Storage::FixedLength { .. } => {
-                self.promote_to_variable();
-                match self {
-                    Storage::Variable ( inner ) => inner,
-                    Storage::FixedLength { ..} => {
-                        //cov::excl-start
-                        unreachable!();
-                        //cov::excl-stop
-                    }
-                }
-            }
-            Storage::Variable ( inner ) => inner,
-        }
-    }
-
     pub(crate) fn cut_start(&mut self, n: u32, conditional: Option<&[bool]>) {
         assert!(
             conditional.is_none() || conditional.as_ref().unwrap().len() == self.len(),
             "Length of conditional bools must match number of entries"
         );
         if let Some(conditional) = conditional {
-            for (ii, position) in self.make_variable().positions.iter_mut().enumerate() {
-                if conditional[ii] {
-                    let entry_len = position.1 - position.0;
+            self.resize_positions(|i, start, stop| {
+                if conditional[i] {
+                    let entry_len = stop - start;
                     let head = n.min(entry_len);
-                    position.0 = position.0.saturating_add(head);
+                    Some((head as usize, (entry_len - head) as usize))
+                } else {
+                    None
                 }
-            }
+            });
         } else {
             match self {
                 Storage::FixedLength {
@@ -189,13 +175,15 @@ impl Storage {
             "Length of conditional bools must match number of entries"
         );
         if let Some(conditional) = conditional {
-            for (ii, position) in self.make_variable().positions.iter_mut().enumerate() {
-                if conditional[ii] {
-                    let entry_len = position.1 - position.0;
+            self.resize_positions(|i, start, stop| {
+                if conditional[i] {
+                    let entry_len = stop - start;
                     let tail = n.min(entry_len);
-                    position.1 = position.1.saturating_sub(tail);
+                    Some((0, (entry_len - tail) as usize))
+                } else {
+                    None
                 }
-            }
+            });
         } else {
             match self {
                 Storage::FixedLength { visible_len, .. } => {
@@ -216,11 +204,101 @@ impl Storage {
             self.len(),
             "Length of conditional bools must match number of entries"
         );
-        for (ii, position) in self.make_variable().positions.iter_mut().enumerate() {
-            if conditional[ii] {
-                let entry_len = position.1 - position.0;
-                let new_len = len.min(entry_len);
-                position.1 = position.0 + new_len;
+        self.resize_positions(|i, start, stop| {
+            if conditional[i] {
+                let entry_len = stop - start;
+                Some((0, len.min(entry_len) as usize))
+            } else {
+                None
+            }
+        });
+    }
+
+    /// Generalized per-entry narrowing. For each live entry `i` (in view
+    /// order), calls `f(i, visible_bytes)` where `visible_bytes` is the entry's
+    /// current visible region inside `data`. The closure returns either:
+    ///
+    /// * `None` — leave the entry unchanged, or
+    /// * `Some((start, len))` — narrow the entry to
+    ///   `visible_bytes[start..start + len]`. The sub-range is relative to the
+    ///   entry's *visible* bytes and must lie within them
+    ///   (`start + len <= visible_bytes.len()`).
+    ///
+    /// No bytes are copied — only positions are rewritten. Promotes
+    /// `FixedLength` → `Variable` and bakes any existing cut / front-drop
+    /// overlays into the positions first, so each position pair is exactly the
+    /// entry's visible region and the rewritten ranges are unambiguous.
+    ///
+    /// # Panics
+    /// If a returned sub-range falls outside the entry's visible region.
+    pub(crate) fn resize_each<F>(&mut self, data: &[u8], mut f: F)
+    where
+        F: FnMut(usize, &BStr) -> Option<(usize, usize)>,
+    {
+        self.resize_positions(|i, start, stop| {
+            f(i, BStr::new(&data[start as usize..stop as usize]))
+        });
+    }
+
+    /// Position-coordinate core shared by the single- and dual-buffer resize
+    /// wrappers. For each live entry `i` (in view order), calls
+    /// `f(i, start, stop)` with the entry's visible byte *range* (in the
+    /// storage's own metadata coordinate space; for dual pods callers add their
+    /// per-buffer offset). `f` returns `None` (unchanged) or `Some((new_start,
+    /// new_len))` *relative to that range*.
+    ///
+    /// Promotes `FixedLength` → `Variable` and bakes any front-drop / cut
+    /// overlays into the positions first, so each `(start, stop)` pair is
+    /// exactly the entry's visible region.
+    ///
+    /// # Panics
+    /// If a returned sub-range falls outside `[0, stop - start]`.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "new_start/new_len are bounded by visible_len, which fits u32 (positions always <= 2**32)"
+    )]
+    pub(crate) fn resize_positions<F>(&mut self, mut f: F)
+    where
+        F: FnMut(usize, u32, u32) -> Option<(usize, usize)>,
+    {
+        self.promote_to_variable();
+        let info = match self {
+            Storage::Variable(info) => info,
+            // cov:excl-start
+            Storage::FixedLength { .. } => unreachable!("just promoted to Variable"),
+            // cov:excl-stop
+        };
+        // Bake the front-drop and per-entry cut overlays into the positions so
+        // each `(start, stop)` pair is precisely the entry's visible region.
+        if info.front_skip > 0 {
+            info.positions.drain(0..info.front_skip as usize);
+            info.front_skip = 0;
+        }
+        if info.head_skip != 0 || info.tail_skip != 0 {
+            for pos in &mut info.positions {
+                let entry_len = pos.1.saturating_sub(pos.0);
+                let head = info.head_skip.min(entry_len);
+                let tail = info.tail_skip.min(entry_len - head);
+                pos.0 += head;
+                pos.1 -= tail;
+            }
+            info.head_skip = 0;
+            info.tail_skip = 0;
+        }
+        for (i, pos) in info.positions.iter_mut().enumerate() {
+            let (start, stop) = *pos;
+            if let Some((new_start, new_len)) = f(i, start, stop) {
+                let visible_len = (stop - start) as usize;
+                assert!(
+                    new_start
+                        .checked_add(new_len)
+                        .is_some_and(|end| end <= visible_len),
+                    "resize: entry {i} sub-range [{new_start}, {new_start}+{new_len}) \
+                     exceeds visible length {visible_len}"
+                );
+                let abs_start = start + new_start as u32;
+                pos.0 = abs_start;
+                pos.1 = abs_start + new_len as u32;
             }
         }
     }

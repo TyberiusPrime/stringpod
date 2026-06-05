@@ -273,6 +273,28 @@ impl StringPod {
         bld.finish()
     }
 
+    /// Generalized per-entry resize. For each entry `i` (in order), invokes
+    /// `f(i, entry)` with the entry's current visible bytes. The closure
+    /// returns:
+    ///
+    /// * `None` — leave the entry unchanged, or
+    /// * `Some((start, len))` — narrow the entry to `entry[start..start + len]`.
+    ///   The sub-range is relative to the entry's current visible bytes and
+    ///   **must lie within them** (`start + len <= entry.len()`); otherwise this
+    ///   panics.
+    ///
+    /// No bytes are copied — only metadata is rewritten — so the new region must
+    /// fall inside the old one. This subsumes [`cut_start`](Self::cut_start),
+    /// [`cut_end`](Self::cut_end), and [`max_len`](Self::max_len) for the case
+    /// where each entry needs an individually-chosen cut (e.g. trimming every
+    /// read at a per-read location). Promotes `FixedLength` → `Variable`.
+    pub fn resize<F>(&mut self, f: F)
+    where
+        F: FnMut(usize, &BStr) -> Option<(usize, usize)>,
+    {
+        self.storage.resize_each(&self.data, f);
+    }
+
     /// Reverse the bytes of every entry in-place. If the byte buffer is
     /// shared (Arc strong count > 1) it is cloned before reversing (COW).
     ///
@@ -1320,6 +1342,149 @@ mod tests {
         assert_eq!(p.get(0), BStr::new("hello"));
         assert_eq!(p.get(1), BStr::new("dlrow"));
         assert_eq!(p.get(2), BStr::new("rust"));
+    }
+
+    // ── conditional ops compose with pop_front (front_skip) ─────────────────
+
+    #[test]
+    fn cut_start_conditional_after_pop_front() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAAA"));
+        bld.push(b("BBB")); // unequal length → Variable storage
+        bld.push(b("CCCCC"));
+        let mut p = bld.finish();
+        assert!(!p.is_fixed_length());
+        p.pop_front(1); // view: "BBB", "CCCCC" (front_skip = 1)
+        p.cut_start(2, Some(&[true, false]));
+        assert_eq!(p.get(0), BStr::new("B")); // "BBB" minus 2 from front
+        assert_eq!(p.get(1), BStr::new("CCCCC")); // untouched
+    }
+
+    #[test]
+    fn cut_end_conditional_after_pop_front() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAAA"));
+        bld.push(b("BBB"));
+        bld.push(b("CCCCC"));
+        let mut p = bld.finish();
+        p.pop_front(1); // view: "BBB", "CCCCC"
+        p.cut_end(2, Some(&[false, true]));
+        assert_eq!(p.get(0), BStr::new("BBB")); // untouched
+        assert_eq!(p.get(1), BStr::new("CCC")); // "CCCCC" minus 2 from end
+    }
+
+    #[test]
+    fn max_len_conditional_after_pop_front() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAAA"));
+        bld.push(b("BBB"));
+        bld.push(b("CCCCC"));
+        let mut p = bld.finish();
+        p.pop_front(1); // view: "BBB", "CCCCC"
+        let p = p.max_len(2, Some(&[true, true]));
+        assert_eq!(p.get(0), BStr::new("BB"));
+        assert_eq!(p.get(1), BStr::new("CC"));
+    }
+
+    // ── resize ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn resize_per_entry_cut_fixed_promotes() {
+        let mut bld = StringPodBuilder::with_capacity(6, 3);
+        bld.push(b("HELLO!"));
+        bld.push(b("WORLD!"));
+        bld.push(b("RUST!!"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        // Cut each entry at a per-entry location: keep [i..i+2].
+        p.resize(|i, _| Some((i, 2)));
+        assert!(!p.is_fixed_length()); // promoted
+        assert_eq!(p.get(0), BStr::new("HE"));
+        assert_eq!(p.get(1), BStr::new("OR"));
+        assert_eq!(p.get(2), BStr::new("ST"));
+    }
+
+    #[test]
+    fn resize_none_leaves_entry_unchanged() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDE"));
+        bld.push(b("FGHIJ"));
+        bld.push(b("KLMNO"));
+        let mut p = bld.finish();
+        // Only narrow odd entries; return None otherwise.
+        p.resize(|i, e| if i % 2 == 1 { Some((1, e.len() - 1)) } else { None });
+        assert_eq!(p.get(0), BStr::new("ABCDE")); // untouched
+        assert_eq!(p.get(1), BStr::new("GHIJ"));
+        assert_eq!(p.get(2), BStr::new("KLMNO")); // untouched
+    }
+
+    #[test]
+    fn resize_max_len_per_entry() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDEFGH"));
+        bld.push(b("XY"));
+        bld.push(b("PQRST"));
+        let mut p = bld.finish();
+        // max_len each entry to 3 bytes (a per-entry-aware clip).
+        p.resize(|_, e| Some((0, e.len().min(3))));
+        assert_eq!(p.get(0), BStr::new("ABC"));
+        assert_eq!(p.get(1), BStr::new("XY")); // already shorter
+        assert_eq!(p.get(2), BStr::new("PQR"));
+    }
+
+    #[test]
+    fn resize_composes_with_prior_cuts() {
+        // cut_start/cut_end leave head/tail overlays the resize must see baked.
+        let mut bld = StringPodBuilder::with_capacity(7, 2);
+        bld.push(b("0123456"));
+        bld.push(b("ABCDEFG"));
+        let mut p = bld.finish();
+        p.cut_start(1, None);
+        p.cut_end(1, None); // visible: "12345", "BCDEF"
+        p.resize(|_, e| {
+            assert_eq!(e.len(), 5); // callback sees the post-cut visible region
+            Some((1, 2))
+        });
+        assert_eq!(p.get(0), BStr::new("23"));
+        assert_eq!(p.get(1), BStr::new("CD"));
+    }
+
+    #[test]
+    fn resize_composes_after_pop_front() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAA"));
+        bld.push(b("BBBB"));
+        bld.push(b("CCCC"));
+        let mut p = bld.finish();
+        p.pop_front(1); // view: "BBBB", "CCCC"
+        let mut seen = Vec::new();
+        p.resize(|i, e| {
+            seen.push((i, e.to_vec()));
+            Some((0, 2))
+        });
+        assert_eq!(seen, vec![(0, b("BBBB").to_vec()), (1, b("CCCC").to_vec())]);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.get(0), BStr::new("BB"));
+        assert_eq!(p.get(1), BStr::new("CC"));
+    }
+
+    #[test]
+    fn resize_to_empty() {
+        let mut bld = StringPodBuilder::with_capacity(4, 1);
+        bld.push(b("ABCD"));
+        let mut p = bld.finish();
+        p.resize(|_, _| Some((2, 0)));
+        assert_eq!(p.get(0), BStr::new(""));
+        assert_eq!(p.entry_len(0), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds visible length")]
+    fn resize_out_of_range_panics() {
+        let mut bld = StringPodBuilder::with_capacity(3, 1);
+        bld.push(b("ABC"));
+        let mut p = bld.finish();
+        p.resize(|_, _| Some((2, 5))); // 2+5 > 3
     }
 
     // ── iter_mut ──────────────────────────────────────────────────────────
