@@ -30,6 +30,19 @@ impl StringPod {
             },
         }
     }
+    #[must_use]
+    pub fn to_exclusive(mut self) -> Self {
+        // if we're not shared, return Self,
+        // otherwise it's time to clone
+        if let Some(_) = Arc::get_mut(&mut self.data) {
+            return self;
+        }
+        Self {
+            data: Arc::new((*self.data).clone()),
+            storage: self.storage,
+        }
+    }
+
     /// An empty pod with no entries and an empty buffer.
     #[must_use]
     pub fn empty() -> Self {
@@ -119,6 +132,11 @@ impl StringPod {
         assert!(range.start <= range.end, "drain range start > end");
         assert!(range.end <= self.len(), "drain range past end of pod");
         self.storage.drain(range);
+    }
+
+    /// Keep only entries where the boolean is true
+    pub fn retain_by_bools(&mut self, keep: &[bool]) {
+        self.storage.retain_by_bools(keep);
     }
 
     /// Append one entry to a *finished* pod, mirroring builder semantics

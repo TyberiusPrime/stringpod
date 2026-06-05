@@ -184,6 +184,24 @@ impl DualStringPod {
     }
 
     #[must_use]
+    pub fn to_exclusive(mut self) -> Self {
+        // if we're not shared, return Self,
+        // otherwise it's time to clone
+        if let Some(_) = Arc::get_mut(&mut self.seq) {
+            if let Some(_) = Arc::get_mut(&mut self.qual) {
+                return self;
+            }
+        }
+        Self {
+            seq: Arc::new((*self.seq).clone()),
+            qual: Arc::new((*self.qual).clone()),
+            storage: self.storage,
+            seq_first_byte: self.seq_first_byte,
+            qual_first_byte: self.qual_first_byte,
+        }
+    }
+
+    #[must_use]
     pub fn len(&self) -> usize {
         self.storage.len()
     }
@@ -281,6 +299,17 @@ impl DualStringPod {
     pub fn cut_end(&mut self, n: usize) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         self.storage.cut_end(n_u32);
+    }
+    
+    /// Drop the first `n` entries from the view. O(1): a byte offset on
+    /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
+    pub fn pop_front(&mut self, n: usize) {
+        self.storage.pop_front(u32::try_from(n).unwrap_or(u32::MAX));
+    }
+
+    /// Truncate the view to at most `len` entries (drops from the back). O(1).
+    pub fn truncate(&mut self, len: usize) {
+        self.storage.truncate(len);
     }
 
     /// # Panics
@@ -403,6 +432,7 @@ impl DualStringPod {
             }
             return self;
         }
+        //TODO: Do not rebuild buffers, just change the lengths!
         let count = self.len();
         let mut bld = DualStringPodBuilder::with_capacity(n, count);
         let mut seq_buf = Vec::with_capacity(n);
@@ -418,6 +448,10 @@ impl DualStringPod {
             bld.push(&seq_buf, &qual_buf);
         }
         bld.finish()
+    }
+
+    pub fn retain_by_bools(&mut self, keep: &[bool]) {
+        self.storage.retain_by_bools(keep);
     }
 
     /// Reverse the bytes of every entry in both columns in-place. If either

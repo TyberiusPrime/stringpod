@@ -291,7 +291,7 @@ fn part_bytes_mut<'p>(
 /// A list of cross-pod record locations. See the [module docs](self).
 #[derive(Debug, Clone)]
 pub struct CrossPodLocations {
-    records: Vec<SmallVec<[Location; 4]>>,
+    records: Vec<SmallVec<[Location; 1]>>, // typical use case is 1
     n_columns: u32,
 }
 
@@ -304,6 +304,7 @@ impl CrossPodLocations {
     /// If the columns do not all have the same entry count.
     #[must_use]
     pub fn per_row<T: CrossPods>(pods: &T) -> Self {
+        //TODO: we need this as a non-allocating iterator,
         let podrefs = pods.pods();
         let colmap = colmap_for(&podrefs);
 
@@ -321,9 +322,9 @@ impl CrossPodLocations {
             first
         };
 
-        let mut records: Vec<SmallVec<[Location; 4]>> = Vec::with_capacity(row_count);
+        let mut records: Vec<SmallVec<[Location; 1]>> = Vec::with_capacity(row_count);
         for entry in 0..row_count {
-            let mut record: SmallVec<[Location; 4]> = SmallVec::with_capacity(colmap.len());
+            let mut record: SmallVec<[Location; 1]> = SmallVec::with_capacity(colmap.len());
             for column in 0..colmap.len() {
                 let len = col_entry_len(&podrefs, &colmap, column, entry);
                 record.push(Location {
@@ -442,7 +443,7 @@ impl CrossPodLocations {
     /// or from whole entries never trip this. Use
     /// [`for_each_mut`](Self::for_each_mut) when you do need overlapping windows.
     #[must_use]
-    pub fn try_iter_mut<'a, T: CrossPods>(&self, pods: &'a mut T) -> Option<RecordsMut<'a, T>> {
+    pub fn try_iter_mut<'a, T: CrossPods>(&self, pods: &'a mut T) -> Option<CrossPodsRecordsMut<'a, T>> {
         let views = column_views_mut(pods.pods_mut())?;
 
         // For each column, gather the (start, len) of every part that lands in
@@ -510,7 +511,7 @@ impl CrossPodLocations {
             companions.push(T::to_companion_mut(parts));
         }
 
-        Some(RecordsMut {
+        Some(CrossPodsRecordsMut {
             inner: companions.into_iter(),
         })
     }
@@ -560,7 +561,7 @@ impl CrossPodLocations {
 /// Iterator over [`CrossPodLocations`] records as companions. Created by
 /// [`CrossPodLocations::iter`].
 pub struct CrossPodRecords<'a, T: CrossPods> {
-    records: &'a [SmallVec<[Location; 4]>],
+    records: &'a [SmallVec<[Location; 1]>],
     pods: SmallVec<[PodRef<'a>; 4]>,
     colmap: SmallVec<[(usize, Sub); 4]>,
     index: usize,
@@ -594,11 +595,11 @@ impl<T: CrossPods> ExactSizeIterator for CrossPodRecords<'_, T> {}
 /// The companions own their `&mut BStr` parts (they don't borrow the iterator),
 /// so the iterator is collectable — every part across the whole iteration is a
 /// distinct, non-overlapping slice, carved out with safe `split_at_mut`.
-pub struct RecordsMut<'a, T: CrossPods> {
+pub struct CrossPodsRecordsMut<'a, T: CrossPods> {
     inner: std::vec::IntoIter<T::CompanionMut<'a>>,
 }
 
-impl<'a, T: CrossPods> Iterator for RecordsMut<'a, T> {
+impl<'a, T: CrossPods> Iterator for CrossPodsRecordsMut<'a, T> {
     type Item = T::CompanionMut<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -610,7 +611,7 @@ impl<'a, T: CrossPods> Iterator for RecordsMut<'a, T> {
     }
 }
 
-impl<T: CrossPods> ExactSizeIterator for RecordsMut<'_, T> {}
+impl<T: CrossPods> ExactSizeIterator for CrossPodsRecordsMut<'_, T> {}
 
 // ── builder ──────────────────────────────────────────────────────────────
 
@@ -619,8 +620,8 @@ impl<T: CrossPods> ExactSizeIterator for RecordsMut<'_, T> {}
 pub struct CrossPodLocationsBuilder<'t> {
     pods: SmallVec<[PodRef<'t>; 4]>,
     colmap: SmallVec<[(usize, Sub); 4]>,
-    current: SmallVec<[Location; 4]>,
-    records: Vec<SmallVec<[Location; 4]>>,
+    current: SmallVec<[Location; 1]>,
+    records: Vec<SmallVec<[Location; 1]>>,
 }
 
 impl<'t> CrossPodLocationsBuilder<'t> {

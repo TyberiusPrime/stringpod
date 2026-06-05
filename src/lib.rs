@@ -29,7 +29,7 @@ mod storage;
 
 pub use cross::{
     CrossPodLocations, CrossPodLocationsBuilder, CrossPodRecords, CrossPods, Location, Pod, PodMut,
-    PodRef, RecordsMut,
+    PodRef, CrossPodsRecordsMut,
 };
 pub use dual::{
     ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,

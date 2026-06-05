@@ -273,6 +273,7 @@ impl Storage {
             return;
         }
         self.promote_to_variable();
+        //TODO: Think about whether we should turn this into adjusting of front_skip instead
         match self {
             Storage::Variable {
                 positions,
@@ -289,6 +290,39 @@ impl Storage {
             }
         }
     }
+
+    /// Keep only entries where the boolean is true
+    pub fn retain_by_bools(&mut self, keep: &[bool]) {
+        assert_eq!(keep.len(), self.len(), "Length of bools must match number of entries");
+        //TODO: optimization if FixedLength & Empty -> just reduce Count.
+        self.promote_to_variable();
+         match self {
+            Storage::Variable {
+                positions,
+                front_skip,
+                ..
+            } => {
+                let mut fs = *front_skip as usize;
+                let mut iter = keep.iter();
+                positions.retain(|_| {
+                    if fs > 0 {
+                        fs -= 1;
+                        false
+                    } else {
+                        *iter.next().expect("Length has been checked")
+                    }
+                });
+            }
+            Storage::FixedLength { .. } => {
+                // cov:excl-start
+                unreachable!("just promoted to Variable")
+                // cov:excl-stop
+            }
+        }
+    }
+
+
+
 
     // ── builder-side helpers ──────────────────────────────────────────────
 
