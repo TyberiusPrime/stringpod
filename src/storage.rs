@@ -181,8 +181,7 @@ impl Storage {
                 positions,
                 front_skip,
                 ..
-            } =>
-            {
+            } => {
                 let live = positions.len() as u32 - *front_skip;
                 *front_skip += n.min(live);
             }

@@ -725,7 +725,7 @@ impl<'t> CrossPodLocationsBuilder<'t> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason="it's tests")]
+#[expect(clippy::unwrap_used, reason = "it's tests")]
 mod tests {
     use super::{CrossPodLocations, CrossPods, Pod, PodMut, PodRef};
     use crate::dual::{DualStringPod, DualStringPodBuilder};

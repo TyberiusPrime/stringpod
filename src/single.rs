@@ -171,7 +171,11 @@ impl StringPod {
     #[must_use]
     pub fn prefix(self, text: &[u8]) -> Self {
         let n = self.len();
-        let first_len = if n > 0 { self.entry_len(0) + text.len() } else { text.len() };
+        let first_len = if n > 0 {
+            self.entry_len(0) + text.len()
+        } else {
+            text.len()
+        };
         let mut bld = StringPodBuilder::with_capacity(first_len, n);
         let mut buf = Vec::with_capacity(first_len);
         for i in 0..n {
@@ -190,7 +194,11 @@ impl StringPod {
     #[must_use]
     pub fn postfix(self, text: &[u8]) -> Self {
         let n = self.len();
-        let first_len = if n > 0 { self.entry_len(0) + text.len() } else { text.len() };
+        let first_len = if n > 0 {
+            self.entry_len(0) + text.len()
+        } else {
+            text.len()
+        };
         let mut bld = StringPodBuilder::with_capacity(first_len, n);
         let mut buf = Vec::with_capacity(first_len);
         for i in 0..n {
@@ -575,7 +583,7 @@ impl StringPodAliasBuilder<'_> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason="it's tests")]
+#[expect(clippy::unwrap_used, reason = "it's tests")]
 mod tests {
     use super::{StringPod, StringPodBuilder};
     use bstr::BStr;
@@ -1105,7 +1113,7 @@ mod tests {
     fn max_len_variable_clips_each_entry() {
         let mut bld = StringPodBuilder::with_capacity(0, 3);
         bld.push(b("ABCDE")); // 5 → 3
-        bld.push(b("AB"));    // 2, already ≤ 3
+        bld.push(b("AB")); // 2, already ≤ 3
         bld.push(b("ABCDEFG")); // 7 → 3
         let p = bld.finish().max_len(3);
         assert_eq!(p.get(0), BStr::new("ABC"));
@@ -1170,8 +1178,8 @@ mod tests {
         let mut p = bld.finish();
         {
             let mut it = p.try_iter_mut().unwrap();
-            it.next().unwrap().reverse();       // ABC → CBA
-            it.next_back().unwrap().reverse();  // GHI → IHG
+            it.next().unwrap().reverse(); // ABC → CBA
+            it.next_back().unwrap().reverse(); // GHI → IHG
             // DEF untouched
         }
         assert_eq!(p.get(0), BStr::new("CBA"));

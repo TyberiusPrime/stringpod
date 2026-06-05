@@ -65,7 +65,7 @@ impl CrossPods for FastQChunk {
         }
     }
 
-    fn to_companion_mut(parts: SmallVec<[& mut BStr; 4]>) -> FastQReadMut<'_> {
+    fn to_companion_mut(parts: SmallVec<[&mut BStr; 4]>) -> FastQReadMut<'_> {
         let mut it = parts.into_iter();
         FastQReadMut {
             name: it.next().expect("name part"),

@@ -336,7 +336,11 @@ impl DualStringPod {
             qual_text.len()
         );
         let n = self.len();
-        let first_len = if n > 0 { self.entry_len(0) + seq_text.len() } else { seq_text.len() };
+        let first_len = if n > 0 {
+            self.entry_len(0) + seq_text.len()
+        } else {
+            seq_text.len()
+        };
         let mut bld = DualStringPodBuilder::with_capacity(first_len, n);
         let mut seq_buf = Vec::with_capacity(first_len);
         let mut qual_buf = Vec::with_capacity(first_len);
@@ -368,7 +372,11 @@ impl DualStringPod {
             qual_text.len()
         );
         let n = self.len();
-        let first_len = if n > 0 { self.entry_len(0) + seq_text.len() } else { seq_text.len() };
+        let first_len = if n > 0 {
+            self.entry_len(0) + seq_text.len()
+        } else {
+            seq_text.len()
+        };
         let mut bld = DualStringPodBuilder::with_capacity(first_len, n);
         let mut seq_buf = Vec::with_capacity(first_len);
         let mut qual_buf = Vec::with_capacity(first_len);
@@ -806,12 +814,10 @@ impl DualStringPodAliasBuilder<'_> {
         );
         // Absolute position in both buffers (seq_first_byte == qual_first_byte
         // for pods built via DualStringPodBuilder, which is the expected source).
-        let abs_start =
-            u32::try_from(r.start + self.source.seq_first_byte + offset)
-                .expect("alias start exceeds u32");
-        let abs_end =
-            u32::try_from(r.start + self.source.seq_first_byte + end)
-                .expect("alias end exceeds u32");
+        let abs_start = u32::try_from(r.start + self.source.seq_first_byte + offset)
+            .expect("alias start exceeds u32");
+        let abs_end = u32::try_from(r.start + self.source.seq_first_byte + end)
+            .expect("alias end exceeds u32");
         self.positions.push((abs_start, abs_end));
         self.next += 1;
     }
@@ -847,7 +853,7 @@ impl DualStringPodAliasBuilder<'_> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-#[expect(clippy::unwrap_used, reason="it's tests")]
+#[expect(clippy::unwrap_used, reason = "it's tests")]
 mod tests {
     use super::{ColumnError, DualStringPod, DualStringPodBuilder};
     use bstr::BStr;
@@ -993,7 +999,7 @@ mod tests {
     fn alias_builder_basic() {
         let mut bld = DualStringPodBuilder::with_capacity(0, 2);
         bld.push(b("HELLOWORLD"), b("0123456789"));
-        bld.push(b("ACGTACGT"),   b("IIIIIIII"));
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
         ab.push_alias(0, 5); // entry 0, offset 0, len 5 → "HELLO" / "01234"
@@ -1343,8 +1349,8 @@ mod tests {
         let mut p = bld.finish();
         {
             let mut it = p.try_iter_mut().unwrap();
-            it.next().unwrap().seq.reverse();       // ACG → GCA
-            it.next_back().unwrap().seq.reverse();  // GCA → ACG
+            it.next().unwrap().seq.reverse(); // ACG → GCA
+            it.next_back().unwrap().seq.reverse(); // GCA → ACG
         }
         assert_eq!(p.seq(0), BStr::new("GCA"));
         assert_eq!(p.seq(1), BStr::new("TTT")); // untouched
