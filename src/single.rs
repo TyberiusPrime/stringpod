@@ -451,7 +451,7 @@ mod tests {
         assert_eq!(p.entry_len(0), 3);
         assert_eq!(p.used_bytes(), 6);
         assert_eq!(p.buffer_bytes(), 10); // bytes still there
-                                          // double cut
+        // double cut
         p.cut_start(1);
         assert_eq!(p.get(0), BStr::new("LO"));
     }

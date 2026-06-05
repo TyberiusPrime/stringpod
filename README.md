@@ -43,4 +43,10 @@ for seq in &pod {
 
 ## License
 
-MIT OR Apache-2.0
+MIT 
+
+
+## Alternatives
+
+Apache arrow BinaryArray. Covers packed buffers + offset array, even with fixed strides.
+Does not cover the DualStringPod case, nor the O(1) operations.
