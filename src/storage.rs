@@ -183,13 +183,44 @@ impl Storage {
         }
     }
 
-    pub(crate) fn cut_end(&mut self, n: u32) {
-        match self {
-            Storage::FixedLength { visible_len, .. } => {
-                *visible_len = visible_len.saturating_sub(n);
+    pub(crate) fn cut_end(&mut self, n: u32, conditional: Option<&[bool]>) {
+        assert!(
+            conditional.is_none() || conditional.as_ref().unwrap().len() == self.len(),
+            "Length of conditional bools must match number of entries"
+        );
+        if let Some(conditional) = conditional {
+            for (ii, position) in self.make_variable().positions.iter_mut().enumerate() {
+                if conditional[ii] {
+                    let entry_len = position.1 - position.0;
+                    let tail = n.min(entry_len);
+                    position.1 = position.1.saturating_sub(tail);
+                }
             }
-            Storage::Variable (VariableInfo { tail_skip, .. }) => {
-                *tail_skip = tail_skip.saturating_add(n);
+        } else {
+            match self {
+                Storage::FixedLength { visible_len, .. } => {
+                    *visible_len = visible_len.saturating_sub(n);
+                }
+                Storage::Variable(VariableInfo { tail_skip, .. }) => {
+                    *tail_skip = tail_skip.saturating_add(n);
+                }
+            }
+        }
+    }
+
+    /// Per-entry byte truncation to at most `len` bytes for entries where
+    /// `conditional[i]` is true. Promotes to `Variable` storage.
+    pub(crate) fn truncate_bytes_conditional(&mut self, len: u32, conditional: &[bool]) {
+        assert_eq!(
+            conditional.len(),
+            self.len(),
+            "Length of conditional bools must match number of entries"
+        );
+        for (ii, position) in self.make_variable().positions.iter_mut().enumerate() {
+            if conditional[ii] {
+                let entry_len = position.1 - position.0;
+                let new_len = len.min(entry_len);
+                position.1 = position.0 + new_len;
             }
         }
     }

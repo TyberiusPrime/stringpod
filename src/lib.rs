@@ -28,8 +28,8 @@ mod single;
 mod storage;
 
 pub use cross::{
-    CrossPodLocations, CrossPodLocationsBuilder, CrossPodRecords, CrossPods, Location, Pod, PodMut,
-    PodRef, CrossPodsRecordsMut,
+    CrossPodLocations, CrossPodLocationsBuilder, CrossPodRecords, CrossPods, CrossPodsRecordsMut,
+    Location, Pod, PodMut, PodRef, RowCompanions,
 };
 pub use dual::{
     ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,

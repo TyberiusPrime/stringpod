@@ -118,9 +118,12 @@ impl StringPod {
     }
 
     /// Cut `n` bytes off the end of every entry. O(1).
-    pub fn cut_end(&mut self, n: usize) {
+    ///
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are affected; this promotes `FixedLength` → `Variable`.
+    pub fn cut_end(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
-        self.storage.cut_end(n_u32);
+        self.storage.cut_end(n_u32, conditional);
     }
 
     /// Remove a contiguous range of entries. Promotes `FixedLength` → `Variable`.
@@ -244,12 +247,20 @@ impl StringPod {
     /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
     /// pods; rebuilds the buffer for `Variable` pods (entries may need to be
     /// clipped by different amounts).
+    ///
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are clipped; this promotes `FixedLength` → `Variable`.
     #[must_use]
-    pub fn max_len(mut self, n: usize) -> Self {
+    pub fn max_len(mut self, n: usize, conditional: Option<&[bool]>) -> Self {
+        if let Some(cond) = conditional {
+            let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
+            self.storage.truncate_bytes_conditional(n_u32, cond);
+            return self;
+        }
         if let Storage::FixedLength { visible_len, .. } = self.storage {
             let vl = visible_len as usize;
             if vl > n {
-                self.cut_end(vl - n);
+                self.cut_end(vl - n, None);
             }
             return self;
         }
@@ -265,19 +276,20 @@ impl StringPod {
     /// Reverse the bytes of every entry in-place. If the byte buffer is
     /// shared (Arc strong count > 1) it is cloned before reversing (COW).
     ///
-    /// # Panics
-    ///
-    /// Doesn't we ensure unique access.
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are reversed.
     #[must_use]
-    pub fn reverse(mut self) -> Self {
+    pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
         if Arc::get_mut(&mut self.data).is_none() {
             self.data = Arc::new((*self.data).clone());
         }
         let data = Arc::get_mut(&mut self.data).expect("just ensured unique");
         let n = self.storage.len();
         for i in 0..n {
-            let r = self.storage.entry_range(i);
-            data[r].reverse();
+            if conditional.map_or(true, |c| c[i]) {
+                let r = self.storage.entry_range(i);
+                data[r].reverse();
+            }
         }
         self
     }
@@ -689,14 +701,14 @@ mod tests {
         bld.push(b("HELLO"));
         bld.push(b("WORLD"));
         let mut p = bld.finish();
-        p.cut_start(2);
+        p.cut_start(2, None);
         assert_eq!(p.get(0), BStr::new("LLO"));
         assert_eq!(p.get(1), BStr::new("RLD"));
         assert_eq!(p.entry_len(0), 3);
         assert_eq!(p.used_bytes(), 6);
         assert_eq!(p.buffer_bytes(), 10); // bytes still there
         // double cut
-        p.cut_start(1);
+        p.cut_start(1, None);
         assert_eq!(p.get(0), BStr::new("LO"));
     }
 
@@ -706,7 +718,7 @@ mod tests {
         bld.push(b("HELLO"));
         bld.push(b("WORLD"));
         let mut p = bld.finish();
-        p.cut_end(2);
+        p.cut_end(2, None);
         assert_eq!(p.get(0), BStr::new("HEL"));
         assert_eq!(p.get(1), BStr::new("WOR"));
     }
@@ -717,8 +729,8 @@ mod tests {
         bld.push(b("ABCDEF"));
         bld.push(b("UVWXYZ"));
         let mut p = bld.finish();
-        p.cut_start(1);
-        p.cut_end(1);
+        p.cut_start(1, None);
+        p.cut_end(1, None);
         assert_eq!(p.get(0), BStr::new("BCDE"));
         assert_eq!(p.get(1), BStr::new("VWXY"));
     }
@@ -729,7 +741,7 @@ mod tests {
         bld.push(b("AAA"));
         bld.push(b("BBB"));
         let mut p = bld.finish();
-        p.cut_start(100);
+        p.cut_start(100, None);
         assert_eq!(p.get(0), BStr::new(""));
         assert_eq!(p.get(1), BStr::new(""));
         assert_eq!(p.entry_len(0), 0);
@@ -741,7 +753,7 @@ mod tests {
         bld.push(b("AB"));
         bld.push(b("XYZWQ"));
         let mut p = bld.finish();
-        p.cut_start(3);
+        p.cut_start(3, None);
         // entry 0 ("AB") is shorter than 3 — saturates to empty
         assert_eq!(p.get(0), BStr::new(""));
         // entry 1 ("XYZWQ") yields "WQ"
@@ -754,7 +766,7 @@ mod tests {
         bld.push(b("AB"));
         bld.push(b("XYZWQ"));
         let mut p = bld.finish();
-        p.cut_end(3);
+        p.cut_end(3, None);
         assert_eq!(p.get(0), BStr::new(""));
         assert_eq!(p.get(1), BStr::new("XY"));
     }
@@ -764,8 +776,8 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(0, 1);
         bld.push(b("ABCDEFG"));
         let mut p = bld.finish();
-        p.cut_start(2);
-        p.cut_end(2);
+        p.cut_start(2, None);
+        p.cut_end(2, None);
         assert_eq!(p.get(0), BStr::new("CDE"));
     }
 
@@ -774,8 +786,8 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(0, 1);
         bld.push(b("ABC"));
         let mut p = bld.finish();
-        p.cut_start(2);
-        p.cut_end(5); // would dip negative
+        p.cut_start(2, None);
+        p.cut_end(5, None); // would dip negative
         assert_eq!(p.get(0), BStr::new(""));
     }
 
@@ -817,8 +829,8 @@ mod tests {
         bld.push(b("EFGH"));
         bld.push(b("IJKL"));
         let mut p = bld.finish();
-        p.cut_start(1);
-        p.cut_end(1);
+        p.cut_start(1, None);
+        p.cut_end(1, None);
         p.drain(1..2); // promotes, removes "FG"
         assert_eq!(p.len(), 2);
         assert_eq!(p.get(0), BStr::new("BC"));
@@ -981,8 +993,8 @@ mod tests {
             ab.push_alias(0, 8); // entry 0, full range
             ab.finish()
         };
-        source.cut_start(3);
-        source.cut_end(3);
+        source.cut_start(3, None);
+        source.cut_end(3, None);
         // Source is now "DE" visible
         assert_eq!(source.get(0), BStr::new("DE"));
         // Alias still sees the full original
@@ -1124,7 +1136,7 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(3, 2);
         bld.push(b("AAA"));
         bld.push(b("BBB"));
-        let p = bld.finish().max_len(5);
+        let p = bld.finish().max_len(5, None);
         assert!(p.is_fixed_length());
         assert_eq!(p.get(0), BStr::new("AAA"));
     }
@@ -1134,7 +1146,7 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(5, 2);
         bld.push(b("HELLO"));
         bld.push(b("WORLD"));
-        let p = bld.finish().max_len(3);
+        let p = bld.finish().max_len(3, None);
         assert!(p.is_fixed_length());
         assert_eq!(p.get(0), BStr::new("HEL"));
         assert_eq!(p.get(1), BStr::new("WOR"));
@@ -1146,7 +1158,7 @@ mod tests {
         bld.push(b("ABCDE")); // 5 → 3
         bld.push(b("AB")); // 2, already ≤ 3
         bld.push(b("ABCDEFG")); // 7 → 3
-        let p = bld.finish().max_len(3);
+        let p = bld.finish().max_len(3, None);
         assert_eq!(p.get(0), BStr::new("ABC"));
         assert_eq!(p.get(1), BStr::new("AB"));
         assert_eq!(p.get(2), BStr::new("ABC"));
@@ -1159,7 +1171,7 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(3, 2);
         bld.push(b("ABC"));
         bld.push(b("XYZ"));
-        let p = bld.finish().reverse();
+        let p = bld.finish().reverse(None);
         assert_eq!(p.get(0), BStr::new("CBA"));
         assert_eq!(p.get(1), BStr::new("ZYX"));
     }
@@ -1170,10 +1182,144 @@ mod tests {
         bld.push(b("ABC"));
         let p = bld.finish();
         let q = p.clone(); // bump Arc refcount
-        let r = p.reverse(); // COW — must clone
+        let r = p.reverse(None); // COW — must clone
         // Original clone still sees "ABC"
         assert_eq!(q.get(0), BStr::new("ABC"));
         assert_eq!(r.get(0), BStr::new("CBA"));
+    }
+
+    // ── conditional operations ────────────────────────────────────────────
+
+    #[test]
+    fn cut_start_conditional_fixed_promotes() {
+        let mut bld = StringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("RUST!"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        // only trim entry 0 and 2
+        p.cut_start(2, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length()); // promoted
+        assert_eq!(p.get(0), BStr::new("LLO"));
+        assert_eq!(p.get(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.get(2), BStr::new("ST!"));
+    }
+
+    #[test]
+    fn cut_start_conditional_variable() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDE"));
+        bld.push(b("XY"));
+        bld.push(b("FOOBAR"));
+        let mut p = bld.finish();
+        p.cut_start(2, Some(&[false, true, false]));
+        assert_eq!(p.get(0), BStr::new("ABCDE"));
+        assert_eq!(p.get(1), BStr::new("")); // "XY" len=2, cut 2 → empty
+        assert_eq!(p.get(2), BStr::new("FOOBAR"));
+    }
+
+    #[test]
+    fn cut_end_conditional_fixed_promotes() {
+        let mut bld = StringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("RUST!"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        p.cut_end(2, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("HEL"));
+        assert_eq!(p.get(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.get(2), BStr::new("RUS"));
+    }
+
+    #[test]
+    fn cut_end_conditional_variable() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDE"));
+        bld.push(b("XY"));
+        bld.push(b("FOOBAR"));
+        let mut p = bld.finish();
+        p.cut_end(3, Some(&[true, false, true]));
+        assert_eq!(p.get(0), BStr::new("AB"));
+        assert_eq!(p.get(1), BStr::new("XY")); // untouched
+        assert_eq!(p.get(2), BStr::new("FOO"));
+    }
+
+    #[test]
+    fn cut_end_conditional_saturates() {
+        let mut bld = StringPodBuilder::with_capacity(0, 2);
+        bld.push(b("AB"));
+        bld.push(b("XYZWQ"));
+        let mut p = bld.finish();
+        // cut 10 from end only for entry 0 (len=2): saturates to empty
+        p.cut_end(10, Some(&[true, false]));
+        assert_eq!(p.get(0), BStr::new(""));
+        assert_eq!(p.get(1), BStr::new("XYZWQ"));
+    }
+
+    #[test]
+    fn truncate_drops_entries() {
+        let mut bld = StringPodBuilder::with_capacity(2, 4);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        bld.push(b("CC"));
+        bld.push(b("DD"));
+        let mut p = bld.finish();
+        p.truncate(2);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.get(0), BStr::new("AA"));
+        assert_eq!(p.get(1), BStr::new("BB"));
+    }
+
+    #[test]
+    fn max_len_conditional_fixed_promotes() {
+        let mut bld = StringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("RUST!"));
+        let p = bld.finish().max_len(3, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("HEL"));
+        assert_eq!(p.get(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.get(2), BStr::new("RUS"));
+    }
+
+    #[test]
+    fn max_len_conditional_variable() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDE")); // 5 → 3
+        bld.push(b("AB")); // 2, untouched (cond=false)
+        bld.push(b("FOOBAR")); // 6 → 3
+        let p = bld.finish().max_len(3, Some(&[true, false, true]));
+        assert_eq!(p.get(0), BStr::new("ABC"));
+        assert_eq!(p.get(1), BStr::new("AB"));
+        assert_eq!(p.get(2), BStr::new("FOO"));
+    }
+
+    #[test]
+    fn reverse_conditional_only_marked() {
+        let mut bld = StringPodBuilder::with_capacity(3, 3);
+        bld.push(b("ABC"));
+        bld.push(b("DEF"));
+        bld.push(b("GHI"));
+        let p = bld.finish().reverse(Some(&[true, false, true]));
+        assert_eq!(p.get(0), BStr::new("CBA"));
+        assert_eq!(p.get(1), BStr::new("DEF")); // untouched
+        assert_eq!(p.get(2), BStr::new("IHG"));
+    }
+
+    #[test]
+    fn reverse_conditional_variable() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("hello"));
+        bld.push(b("world"));
+        bld.push(b("rust"));
+        let p = bld.finish().reverse(Some(&[false, true, false]));
+        assert_eq!(p.get(0), BStr::new("hello"));
+        assert_eq!(p.get(1), BStr::new("dlrow"));
+        assert_eq!(p.get(2), BStr::new("rust"));
     }
 
     // ── iter_mut ──────────────────────────────────────────────────────────
@@ -1241,8 +1387,8 @@ mod tests {
         bld.push(b("UVWXYZ"));
         bld.push(b("012345"));
         let mut p = bld.finish();
-        p.cut_start(1);
-        p.cut_end(1); // visible: "BCDE", "VWXY", "1234"
+        p.cut_start(1, None);
+        p.cut_end(1, None); // visible: "BCDE", "VWXY", "1234"
         for entry in p.try_iter_mut().unwrap() {
             entry.reverse();
         }

@@ -159,6 +159,57 @@ pub trait CrossPods {
     /// them (each `&mut BStr` is moved into a field). Parts are in push order,
     /// the same order as [`to_companion`](Self::to_companion).
     fn to_companion_mut(parts: SmallVec<[&mut BStr; 4]>) -> Self::CompanionMut<'_>;
+
+    /// Iterate the natural row-zip directly — record `i` is the whole entry `i`
+    /// of every column, assembled into a [`Companion`](Self::Companion) — with
+    /// no intermediate [`CrossPodLocations`]. This is the common case; reach for
+    /// [`CrossPodLocations`] only when records are hand-rolled from arbitrary
+    /// cross-column sub-slices.
+    ///
+    /// Borrows only `self`, so (unlike [`CrossPodLocations::iter`], which also
+    /// borrows the index) the returned iterator can be handed back from a
+    /// function that owns the pods. Allocates nothing per record.
+    ///
+    /// # Panics
+    /// If the columns do not all have the same entry count.
+    fn iter(&self) -> RowCompanions<'_, Self>
+    where
+        Self: Sized,
+    {
+        let pods = self.pods();
+        let colmap = colmap_for(&pods);
+        let row_count = checked_row_count(&pods, &colmap);
+        RowCompanions {
+            pods,
+            colmap,
+            row_count,
+            index: 0,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The mutable counterpart of [`iter`](Self::iter): the natural row-zip as
+    /// [`CompanionMut`](Self::CompanionMut)s, no intermediate index to keep
+    /// alive. The returned iterator owns its `&mut BStr` parts (it borrows only
+    /// the pods, not any index), so it is collectable just like
+    /// [`CrossPodLocations::try_iter_mut`].
+    ///
+    /// Returns `None` (mutating nothing) if any pod's backing buffer is shared
+    /// (`Arc` strong count > 1). Whole-entry parts in distinct entries are
+    /// disjoint by construction, so this never panics on overlap.
+    ///
+    /// # Panics
+    /// If the columns do not all have the same entry count.
+    fn try_iter_mut(&mut self) -> Option<CrossPodsRecordsMut<'_, Self>>
+    where
+        Self: Sized,
+    {
+        // The per_row index is consumed by the peeling step and dropped here;
+        // try_iter_mut's result borrows only the pods, not the index, so it
+        // outlives this local cleanly.
+        let locs = CrossPodLocations::per_row(self);
+        locs.try_iter_mut(self)
+    }
 }
 
 // ── column flattening helpers ──────────────────────────────────────────────
@@ -220,6 +271,45 @@ fn part_bytes<'a>(pods: &[PodRef<'a>], colmap: &[(usize, Sub)], loc: Location) -
     let start = loc.offset as usize;
     let stop = start + loc.len as usize;
     BStr::new(&whole[start..stop])
+}
+
+/// Resolve the whole visible bytes of `entry` in a flattened column, without
+/// going through a [`Location`]. The on-the-fly row-zip path uses this so it
+/// never has to mint (and immediately re-decode) a synthetic location.
+fn whole_entry_bytes<'a>(
+    pods: &[PodRef<'a>],
+    colmap: &[(usize, Sub)],
+    column: usize,
+    entry: usize,
+) -> &'a BStr {
+    let (pod_index, sub) = colmap[column];
+    match (pods[pod_index], sub) {
+        (PodRef::Single(pod), Sub::Single) => pod.get(entry),
+        (PodRef::Dual(pod), Sub::Seq) => pod.seq(entry),
+        (PodRef::Dual(pod), Sub::Qual) => pod.qual(entry),
+        _ => unreachable!("colmap/pods variant mismatch"),
+    }
+}
+
+/// The number of records a natural row-zip yields: every column's entry count,
+/// which must agree. Shared by [`CrossPodLocations::per_row`] and the direct
+/// [`CrossPods::iter`] / [`CrossPods::try_iter_mut`] row iterators.
+///
+/// # Panics
+/// If the columns do not all have the same entry count.
+fn checked_row_count(pods: &[PodRef<'_>], colmap: &[(usize, Sub)]) -> usize {
+    if colmap.is_empty() {
+        return 0;
+    }
+    let first = col_len(pods, colmap, 0);
+    for column in 1..colmap.len() {
+        assert_eq!(
+            col_len(pods, colmap, column),
+            first,
+            "column {column} has a different entry count than column 0",
+        );
+    }
+    first
 }
 
 /// Per-column mutable view: the whole buffer slice, the storage that maps
@@ -304,23 +394,9 @@ impl CrossPodLocations {
     /// If the columns do not all have the same entry count.
     #[must_use]
     pub fn per_row<T: CrossPods>(pods: &T) -> Self {
-        //TODO: we need this as a non-allocating iterator,
         let podrefs = pods.pods();
         let colmap = colmap_for(&podrefs);
-
-        let row_count = if colmap.is_empty() {
-            0
-        } else {
-            let first = col_len(&podrefs, &colmap, 0);
-            for column in 1..colmap.len() {
-                assert_eq!(
-                    col_len(&podrefs, &colmap, column),
-                    first,
-                    "per_row: column {column} has a different entry count than column 0",
-                );
-            }
-            first
-        };
+        let row_count = checked_row_count(&podrefs, &colmap);
 
         let mut records: Vec<SmallVec<[Location; 1]>> = Vec::with_capacity(row_count);
         for entry in 0..row_count {
@@ -588,6 +664,44 @@ impl<'a, T: CrossPods> Iterator for CrossPodRecords<'a, T> {
 }
 
 impl<T: CrossPods> ExactSizeIterator for CrossPodRecords<'_, T> {}
+
+/// Iterator over a [`CrossPods`]' natural row-zip as companions, with no
+/// backing [`CrossPodLocations`]. Created by [`CrossPods::iter`].
+///
+/// It borrows only the pods (the whole-entry parts are synthesized on the fly
+/// from the row index), so it can be returned from a function that owns the
+/// pods — the case where threading a separate index through is awkward.
+pub struct RowCompanions<'a, T: CrossPods> {
+    pods: SmallVec<[PodRef<'a>; 4]>,
+    colmap: SmallVec<[(usize, Sub); 4]>,
+    row_count: usize,
+    index: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<'a, T: CrossPods> Iterator for RowCompanions<'a, T> {
+    type Item = T::Companion<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.row_count {
+            return None;
+        }
+        let entry = self.index;
+        self.index += 1;
+        let mut parts: SmallVec<[&'a BStr; 4]> = SmallVec::with_capacity(self.colmap.len());
+        for column in 0..self.colmap.len() {
+            parts.push(whole_entry_bytes(&self.pods, &self.colmap, column, entry));
+        }
+        Some(T::to_companion(&parts))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.row_count - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T: CrossPods> ExactSizeIterator for RowCompanions<'_, T> {}
 
 /// Iterator over [`CrossPodLocations`] records as mutable companions. Created
 /// by [`CrossPodLocations::iter_mut`].
@@ -878,6 +992,88 @@ mod tests {
         let it = locs.iter(&chunk);
         assert_eq!(it.len(), 2);
         assert_eq!(it.size_hint(), (2, Some(2)));
+    }
+
+    #[test]
+    fn trait_iter_yields_every_record() {
+        let chunk = chunk();
+        let reads: Vec<_> = chunk.iter().collect();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(reads[0].name, BStr::new("read1"));
+        assert_eq!(reads[0].seq, BStr::new("ACGT"));
+        assert_eq!(reads[0].qual, BStr::new("IIII"));
+        assert_eq!(reads[1].seq, BStr::new("TTGG"));
+        assert_eq!(reads[1].plus, BStr::new("+"));
+    }
+
+    #[test]
+    fn trait_iter_is_exact_size() {
+        let chunk = chunk();
+        let it = chunk.iter();
+        assert_eq!(it.len(), 2);
+        assert_eq!(it.size_hint(), (2, Some(2)));
+    }
+
+    #[test]
+    fn trait_iter_is_returnable_from_owning_fn() {
+        // The motivating case: hand back the iterator from a function that owns
+        // the pods, with no CrossPodLocations to keep alive. This does not
+        // compile through CrossPodLocations::iter (it borrows the index too).
+        fn reads(chunk: &FastQChunk) -> super::RowCompanions<'_, FastQChunk> {
+            chunk.iter()
+        }
+        let chunk = chunk();
+        let collected: Vec<_> = reads(&chunk).map(|r| r.name).collect();
+        assert_eq!(collected, vec![BStr::new("read1"), BStr::new("read2")]);
+    }
+
+    #[test]
+    fn trait_iter_matches_locations_iter() {
+        let chunk = chunk();
+        let locs = CrossPodLocations::per_row(&chunk);
+        let via_index: Vec<_> = locs.iter(&chunk).collect();
+        let direct: Vec<_> = chunk.iter().collect();
+        assert_eq!(via_index, direct);
+    }
+
+    #[test]
+    #[should_panic(expected = "different entry count")]
+    fn trait_iter_unequal_columns_panics() {
+        let mut short = StringPodBuilder::with_capacity(0, 1);
+        short.push(b("only-one"));
+        let chunk = FastQChunk {
+            name: short.finish(), // 1 entry
+            seq_qual: seq_qual(), // 2 entries
+            plus: pluses(),
+        };
+        let _ = chunk.iter().count();
+    }
+
+    #[test]
+    fn trait_try_iter_mut_mutates_whole_records() {
+        let mut chunk = chunk();
+        {
+            let mut it = chunk.try_iter_mut().unwrap();
+            assert_eq!(it.len(), 2);
+            for read in &mut it {
+                read.name.make_ascii_uppercase();
+                read.seq.reverse();
+            }
+        }
+        let after = CrossPodLocations::per_row(&chunk);
+        let read0 = after.get(&chunk, 0).unwrap();
+        assert_eq!(read0.name, BStr::new("READ1"));
+        assert_eq!(read0.seq, BStr::new("TGCA"));
+        let read1 = after.get(&chunk, 1).unwrap();
+        assert_eq!(read1.name, BStr::new("READ2"));
+        assert_eq!(read1.seq, BStr::new("GGTT"));
+    }
+
+    #[test]
+    fn trait_try_iter_mut_returns_none_when_shared() {
+        let mut chunk = chunk();
+        let _shared = chunk.seq_qual.clone();
+        assert!(chunk.try_iter_mut().is_none());
     }
 
     #[test]

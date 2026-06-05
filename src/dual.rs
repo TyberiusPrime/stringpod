@@ -311,9 +311,13 @@ impl DualStringPod {
         self.storage.cut_start(n_u32, conditional);
     }
 
+    /// Cut `n` bytes off the end of every entry (both seq and qual). O(1).
+    ///
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are affected; this promotes `FixedLength` → `Variable`.
     pub fn cut_end(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
-        //self.storage.cut_end(n_u32, conditional);
+        self.storage.cut_end(n_u32, conditional);
     }
 
     /// Drop the first `n` entries from the view. O(1): a byte offset on
@@ -438,8 +442,16 @@ impl DualStringPod {
 
     /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
     /// pods; rebuilds both buffers for `Variable` pods.
+    ///
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are clipped; this promotes `FixedLength` → `Variable`.
     #[must_use]
-    pub fn max_len(mut self, n: usize) -> Self {
+    pub fn max_len(mut self, n: usize, conditional: Option<&[bool]>) -> Self {
+        if let Some(cond) = conditional {
+            let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
+            self.storage.truncate_bytes_conditional(n_u32, cond);
+            return self;
+        }
         if let Storage::FixedLength { visible_len, .. } = self.storage {
             let vl = visible_len as usize;
             if vl > n {
@@ -447,7 +459,6 @@ impl DualStringPod {
             }
             return self;
         }
-        //TODO: Do not rebuild buffers, just change the lengths!
         let count = self.len();
         let mut bld = DualStringPodBuilder::with_capacity(n, count);
         let mut seq_buf = Vec::with_capacity(n);
@@ -473,10 +484,10 @@ impl DualStringPod {
     /// buffer is shared (Arc strong count > 1) it is cloned before reversing
     /// (COW).
     ///
-    /// # Panics
-    /// Can't since we ensure exclusive access
+    /// If `conditional` is `Some`, only entries where the boolean is `true`
+    /// are reversed.
     #[must_use]
-    pub fn reverse(mut self) -> Self {
+    pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
         if Arc::get_mut(&mut self.seq).is_none() {
             self.seq = Arc::new((*self.seq).clone());
         }
@@ -489,9 +500,11 @@ impl DualStringPod {
         let seq = Arc::get_mut(&mut self.seq).expect("just ensured unique");
         let qual = Arc::get_mut(&mut self.qual).expect("just ensured unique");
         for i in 0..n {
-            let r = self.storage.entry_range(i);
-            seq[r.start + seq_first_byte..r.end + seq_first_byte].reverse();
-            qual[r.start + qual_first_byte..r.end + qual_first_byte].reverse();
+            if conditional.map_or(true, |c| c[i]) {
+                let r = self.storage.entry_range(i);
+                seq[r.start + seq_first_byte..r.end + seq_first_byte].reverse();
+                qual[r.start + qual_first_byte..r.end + qual_first_byte].reverse();
+            }
         }
         self
     }
@@ -960,7 +973,7 @@ mod tests {
         bld.push(b("HELLO"), b("12345"));
         bld.push(b("WORLD"), b("67890"));
         let mut p = bld.finish();
-        p.cut_start(2);
+        p.cut_start(2, None);
         assert_eq!(p.seq(0), BStr::new("LLO"));
         assert_eq!(p.qual(0), BStr::new("345"));
         assert_eq!(p.seq(1), BStr::new("RLD"));
@@ -972,7 +985,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(5, 1);
         bld.push(b("HELLO"), b("12345"));
         let mut p = bld.finish();
-        p.cut_end(2);
+        p.cut_end(2, None);
         assert_eq!(p.seq(0), BStr::new("HEL"));
         assert_eq!(p.qual(0), BStr::new("123"));
     }
@@ -983,8 +996,8 @@ mod tests {
         bld.push(b("ABCDEF"), b("uvwxyz"));
         bld.push(b("123"), b("XYZ"));
         let mut p = bld.finish();
-        p.cut_start(1);
-        p.cut_end(1);
+        p.cut_start(1, None);
+        p.cut_end(1, None);
         assert_eq!(p.seq(0), BStr::new("BCDE"));
         assert_eq!(p.qual(0), BStr::new("vwxy"));
         assert_eq!(p.seq(1), BStr::new("2"));
@@ -1319,7 +1332,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(5, 2);
         bld.push(b("HELLO"), b("12345"));
         bld.push(b("WORLD"), b("67890"));
-        let p = bld.finish().max_len(3);
+        let p = bld.finish().max_len(3, None);
         assert!(p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("HEL"));
         assert_eq!(p.qual(0), BStr::new("123"));
@@ -1330,7 +1343,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(0, 2);
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("II"));
-        let p = bld.finish().max_len(4);
+        let p = bld.finish().max_len(4, None);
         assert_eq!(p.seq(0), BStr::new("ACGT"));
         assert_eq!(p.qual(0), BStr::new("IIII"));
         assert_eq!(p.seq(1), BStr::new("AC"));
@@ -1344,7 +1357,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(4, 2);
         bld.push(b("ACGT"), b("IIII"));
         bld.push(b("TTTT"), b("####"));
-        let p = bld.finish().reverse();
+        let p = bld.finish().reverse(None);
         assert_eq!(p.seq(0), BStr::new("TGCA"));
         assert_eq!(p.qual(0), BStr::new("IIII"));
         assert_eq!(p.seq(1), BStr::new("TTTT"));
@@ -1357,9 +1370,128 @@ mod tests {
         bld.push(b("ACG"), b("III"));
         let p = bld.finish();
         let q = p.clone();
-        let r = p.reverse();
+        let r = p.reverse(None);
         assert_eq!(q.seq(0), BStr::new("ACG"));
         assert_eq!(r.seq(0), BStr::new("GCA"));
+    }
+
+    // ── conditional operations ────────────────────────────────────────────
+
+    #[test]
+    fn dual_cut_start_conditional_fixed_promotes() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        bld.push(b("RUST!"), b("ABCDE"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        p.cut_start(2, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("LLO"));
+        assert_eq!(p.qual(0), BStr::new("345"));
+        assert_eq!(p.seq(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.qual(1), BStr::new("67890"));
+        assert_eq!(p.seq(2), BStr::new("ST!"));
+        assert_eq!(p.qual(2), BStr::new("CDE"));
+    }
+
+    #[test]
+    fn dual_cut_end_conditional_fixed_promotes() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        bld.push(b("RUST!"), b("ABCDE"));
+        let mut p = bld.finish();
+        assert!(p.is_fixed_length());
+        p.cut_end(2, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("HEL"));
+        assert_eq!(p.qual(0), BStr::new("123"));
+        assert_eq!(p.seq(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.qual(1), BStr::new("67890"));
+        assert_eq!(p.seq(2), BStr::new("RUS"));
+        assert_eq!(p.qual(2), BStr::new("ABC"));
+    }
+
+    #[test]
+    fn dual_cut_end_conditional_variable() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
+        bld.push(b("AC"), b("JJ"));
+        let mut p = bld.finish();
+        p.cut_end(3, Some(&[true, false]));
+        assert_eq!(p.seq(0), BStr::new("ACGTA"));
+        assert_eq!(p.qual(0), BStr::new("IIIII"));
+        assert_eq!(p.seq(1), BStr::new("AC")); // untouched
+        assert_eq!(p.qual(1), BStr::new("JJ"));
+    }
+
+    #[test]
+    fn dual_truncate_drops_entries() {
+        let mut bld = DualStringPodBuilder::with_capacity(2, 3);
+        bld.push(b("AA"), b("11"));
+        bld.push(b("BB"), b("22"));
+        bld.push(b("CC"), b("33"));
+        let mut p = bld.finish();
+        p.truncate(2);
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.seq(0), BStr::new("AA"));
+        assert_eq!(p.seq(1), BStr::new("BB"));
+    }
+
+    #[test]
+    fn dual_max_len_conditional_fixed_promotes() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        bld.push(b("RUST!"), b("ABCDE"));
+        let p = bld.finish().max_len(3, Some(&[true, false, true]));
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("HEL"));
+        assert_eq!(p.qual(0), BStr::new("123"));
+        assert_eq!(p.seq(1), BStr::new("WORLD")); // untouched
+        assert_eq!(p.qual(1), BStr::new("67890"));
+        assert_eq!(p.seq(2), BStr::new("RUS"));
+        assert_eq!(p.qual(2), BStr::new("ABC"));
+    }
+
+    #[test]
+    fn dual_max_len_conditional_variable() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
+        bld.push(b("AC"), b("JJ"));
+        let p = bld.finish().max_len(4, Some(&[true, false]));
+        assert_eq!(p.seq(0), BStr::new("ACGT"));
+        assert_eq!(p.qual(0), BStr::new("IIII"));
+        assert_eq!(p.seq(1), BStr::new("AC")); // untouched
+        assert_eq!(p.qual(1), BStr::new("JJ"));
+    }
+
+    #[test]
+    fn dual_reverse_conditional_only_marked() {
+        let mut bld = DualStringPodBuilder::with_capacity(4, 3);
+        bld.push(b("ACGT"), b("IIII"));
+        bld.push(b("TTTT"), b("####"));
+        bld.push(b("GCCA"), b("FFFF"));
+        let p = bld.finish().reverse(Some(&[true, false, true]));
+        assert_eq!(p.seq(0), BStr::new("TGCA"));
+        assert_eq!(p.qual(0), BStr::new("IIII")); // palindrome
+        assert_eq!(p.seq(1), BStr::new("TTTT")); // untouched (palindrome anyway)
+        assert_eq!(p.qual(1), BStr::new("####"));
+        assert_eq!(p.seq(2), BStr::new("ACCG"));
+        assert_eq!(p.qual(2), BStr::new("FFFF"));
+    }
+
+    #[test]
+    fn dual_reverse_conditional_variable() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
+        bld.push(b("AC"), b("JJ"));
+        let p = bld.finish().reverse(Some(&[false, true]));
+        assert_eq!(p.seq(0), BStr::new("ACGTACGT")); // untouched
+        assert_eq!(p.qual(0), BStr::new("IIIIIIII"));
+        assert_eq!(p.seq(1), BStr::new("CA"));
+        assert_eq!(p.qual(1), BStr::new("JJ")); // palindrome
     }
 
     // ── try_iter_mut ──────────────────────────────────────────────────────────
@@ -1412,8 +1544,8 @@ mod tests {
         bld.push(b("HELLO"), b("12345"));
         bld.push(b("WORLD"), b("67890"));
         let mut p = bld.finish();
-        p.cut_start(1);
-        p.cut_end(1); // visible seq: "ELL","ORL"; qual: "234","789"
+        p.cut_start(1, None);
+        p.cut_end(1, None); // visible seq: "ELL","ORL"; qual: "234","789"
         for e in p.try_iter_mut().unwrap() {
             e.seq.reverse();
             e.qual.reverse();
