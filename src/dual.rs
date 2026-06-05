@@ -55,8 +55,8 @@ pub struct DualStringPod {
     pub(crate) qual: Arc<Vec<u8>>,
     pub(crate) storage: Storage,
 
-    seq_first_byte: usize,
-    qual_first_byte: usize,
+    pub(crate) seq_first_byte: usize,
+    pub(crate) qual_first_byte: usize,
 }
 
 impl DualStringPod {

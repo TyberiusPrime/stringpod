@@ -22,10 +22,15 @@
 //! their bytes orphaned in the buffer (rebuild via a new pod if reclamation
 //! matters).
 
+mod cross;
 mod dual;
 mod single;
 mod storage;
 
+pub use cross::{
+    CrossPodLocations, CrossPodLocationsBuilder, CrossPods, Location, Pod, PodMut, PodRef, Records,
+    RecordsMut,
+};
 pub use dual::{
     ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,
     DualStringPodBuilder,
