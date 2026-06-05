@@ -17,6 +17,19 @@ pub struct StringPod {
 }
 
 impl StringPod {
+    #[must_use]
+    pub fn new_all_empty(count: u32) -> Self {
+        Self {
+            data: Arc::new(Vec::new()),
+            storage: Storage::FixedLength {
+                stride: 0,
+                head_skip: 0,
+                visible_len: 0,
+                count,
+                front_byte: 0,
+            },
+        }
+    }
     /// An empty pod with no entries and an empty buffer.
     #[must_use]
     pub fn empty() -> Self {
@@ -1319,5 +1332,23 @@ mod tests {
         assert_send_sync::<StringPod>();
         assert_send_sync::<super::StringPodBuilder>();
         assert_send_sync::<super::StringPodAliasBuilder<'static>>();
+    }
+
+    #[test]
+    fn test_empty() {
+        let mut bld = StringPodBuilder::with_capacity(0, 1);
+        bld.push(b"");
+        bld.push(b"");
+        bld.push(b"");
+        bld.push(b"");
+        let p = bld.finish();
+        for ii in 0..4 {
+            assert_eq!(p.get(ii), b"");
+        }
+        let p2 = StringPod::new_all_empty(10);
+        assert_eq!(p2.len(), 10);
+        for astring in p2.iter() {
+            assert!(astring.is_empty());
+        }
     }
 }
