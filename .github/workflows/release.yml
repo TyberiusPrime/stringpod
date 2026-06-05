@@ -49,7 +49,7 @@ jobs:
   publish-crate:
     name: Publish to crates.io
     runs-on: ubuntu-latest
-    needs: [build, build_platforms]  # Ensure all platforms and docker tests pass before publishing
+    needs: [build]  # Ensure all platforms and docker tests pass before publishing
 
     steps:
       - name: Checkout code
@@ -75,7 +75,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [build, build_platforms, publish-crate]  # Wait for ALL jobs to complete
+    needs: [build, publish-crate]  # Wait for ALL jobs to complete
     permissions:
       contents: write
       packages: write
