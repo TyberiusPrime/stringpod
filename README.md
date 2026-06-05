@@ -2,6 +2,13 @@
 
 Cache-friendly columnar storage for many small byte strings, for example DNA sequences.
 
+## Motivation
+
+- Allocating and deallocating many smallish strings is slow.
+- DNA sequencing data should represent sequences and their quality scores in a structure
+that ensures their lengths match.
+- Zero-copy, O(1) operations are nice. So is COW.
+
 ## Types
 
 - **`StringPod`** — one column of byte strings backed by a single `Arc<Vec<u8>>`
