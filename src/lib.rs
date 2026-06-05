@@ -28,7 +28,7 @@ mod single;
 mod storage;
 
 pub use cross::{
-    CrossPodLocations, CrossPodLocationsBuilder, CrossPods, Location, Pod, PodMut, PodRef, Records,
+    CrossPodLocations, CrossPodLocationsBuilder, CrossPods, Location, Pod, PodMut, PodRef, CrossPodRecords,
     RecordsMut,
 };
 pub use dual::{

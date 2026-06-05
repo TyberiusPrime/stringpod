@@ -89,6 +89,9 @@ impl DualStringPod {
     /// - [`ColumnError::NotATranslation`] when the per-entry starts are not a
     ///   constant translation of each other — at which point it's time to tell
     ///   the consumer that this ain't FASTQ.
+    ///
+    /// # Panics
+    /// When exceeding u32 range
     pub fn try_from_columns(seq: StringPod, qual: StringPod) -> Result<Self, ColumnError> {
         if seq.len() != qual.len() {
             return Err(ColumnError::EqualCountViolated);
@@ -412,6 +415,9 @@ impl DualStringPod {
     /// Reverse the bytes of every entry in both columns in-place. If either
     /// buffer is shared (Arc strong count > 1) it is cloned before reversing
     /// (COW).
+    ///
+    /// # Panics
+    /// Can't since we ensure exclusive access
     #[must_use]
     pub fn reverse(mut self) -> Self {
         if Arc::get_mut(&mut self.seq).is_none() {
@@ -435,7 +441,7 @@ impl DualStringPod {
 
     /// Returns a mutable iterator over seq+qual entry pairs, or `None` if
     /// either byte buffer is shared (Arc strong count > 1).
-    pub fn iter_mut(&mut self) -> Option<DualIterMut<'_>> {
+    pub fn try_iter_mut(&mut self) -> Option<DualIterMut<'_>> {
         let back = self.storage.len();
         let seq_first_byte = self.seq_first_byte;
         let qual_first_byte = self.qual_first_byte;
@@ -772,7 +778,7 @@ pub struct DualStringPodAliasBuilder<'a> {
     positions: Vec<(u32, u32)>,
 }
 
-impl<'a> DualStringPodAliasBuilder<'a> {
+impl DualStringPodAliasBuilder<'_> {
     /// Alias the next source entry, taking `source_entry[offset..offset+len]`
     /// in both the seq and qual buffers.
     ///
@@ -841,6 +847,7 @@ impl<'a> DualStringPodAliasBuilder<'a> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason="it's tests")]
 mod tests {
     use super::{ColumnError, DualStringPod, DualStringPodBuilder};
     use bstr::BStr;
@@ -1300,7 +1307,7 @@ mod tests {
         assert_eq!(r.seq(0), BStr::new("GCA"));
     }
 
-    // ── iter_mut ──────────────────────────────────────────────────────────
+    // ── try_iter_mut ──────────────────────────────────────────────────────────
 
     #[test]
     fn dual_iter_mut_allows_in_place_mutation() {
@@ -1308,7 +1315,7 @@ mod tests {
         bld.push(b("ACGT"), b("IIII"));
         bld.push(b("TTTT"), b("####"));
         let mut p = bld.finish();
-        for entry in p.iter_mut().unwrap() {
+        for entry in p.try_iter_mut().unwrap() {
             entry.seq.reverse();
             entry.qual.reverse();
         }
@@ -1324,7 +1331,7 @@ mod tests {
         bld.push(b("AB"), b("12"));
         let mut p = bld.finish();
         let _q = p.clone();
-        assert!(p.iter_mut().is_none());
+        assert!(p.try_iter_mut().is_none());
     }
 
     #[test]
@@ -1335,7 +1342,7 @@ mod tests {
         bld.push(b("GCA"), b("FFF"));
         let mut p = bld.finish();
         {
-            let mut it = p.iter_mut().unwrap();
+            let mut it = p.try_iter_mut().unwrap();
             it.next().unwrap().seq.reverse();       // ACG → GCA
             it.next_back().unwrap().seq.reverse();  // GCA → ACG
         }
@@ -1352,7 +1359,7 @@ mod tests {
         let mut p = bld.finish();
         p.cut_start(1);
         p.cut_end(1); // visible seq: "ELL","ORL"; qual: "234","789"
-        for e in p.iter_mut().unwrap() {
+        for e in p.try_iter_mut().unwrap() {
             e.seq.reverse();
             e.qual.reverse();
         }
@@ -1368,7 +1375,7 @@ mod tests {
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("JJ"));
         let mut p = bld.finish();
-        for e in p.iter_mut().unwrap() {
+        for e in p.try_iter_mut().unwrap() {
             e.seq.make_ascii_lowercase();
         }
         assert_eq!(p.seq(0), BStr::new("acgtacgt"));
@@ -1386,7 +1393,7 @@ mod tests {
         let qual = fixed_pod(4, &["IIII", "FFFF"]); // qual_first_byte 0
         let mut dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         // Sources were moved in, so both Arcs are uniquely owned here.
-        for e in dual.iter_mut().unwrap() {
+        for e in dual.try_iter_mut().unwrap() {
             e.seq.make_ascii_lowercase();
             e.qual.make_ascii_lowercase();
         }
@@ -1404,7 +1411,7 @@ mod tests {
         bld.push(b("CC"), b("33"));
         let mut p = bld.finish();
         {
-            let all: Vec<_> = p.iter_mut().unwrap().collect();
+            let all: Vec<_> = p.try_iter_mut().unwrap().collect();
             assert_eq!(all.len(), 3);
             for e in all {
                 e.seq.make_ascii_lowercase();

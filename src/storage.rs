@@ -163,6 +163,7 @@ impl Storage {
     /// Drop the first `n` live entries from the view. O(1): a byte offset on
     /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
     pub(crate) fn pop_front(&mut self, n: u32) {
+        #[expect(clippy::cast_possible_truncation, reason = "Positions always <= 2**32")]
         match self {
             Storage::FixedLength {
                 stride,
@@ -180,7 +181,8 @@ impl Storage {
                 positions,
                 front_skip,
                 ..
-            } => {
+            } =>
+            {
                 let live = positions.len() as u32 - *front_skip;
                 *front_skip += n.min(live);
             }
@@ -188,6 +190,7 @@ impl Storage {
     }
 
     /// Truncate the view to at most `len` live entries (drops from the back).
+    #[expect(clippy::cast_possible_truncation, reason = "count always <= 2**32")]
     pub(crate) fn truncate(&mut self, len: usize) {
         match self {
             Storage::FixedLength { count, .. } => {

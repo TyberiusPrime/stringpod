@@ -225,6 +225,10 @@ impl StringPod {
 
     /// Reverse the bytes of every entry in-place. If the byte buffer is
     /// shared (Arc strong count > 1) it is cloned before reversing (COW).
+    ///
+    /// # Panics
+    ///
+    /// Doesn't we ensure unique access.
     #[must_use]
     pub fn reverse(mut self) -> Self {
         if Arc::get_mut(&mut self.data).is_none() {
@@ -241,7 +245,7 @@ impl StringPod {
 
     /// Returns a mutable iterator over entries, or `None` if the byte buffer
     /// is shared (Arc strong count > 1).
-    pub fn iter_mut(&mut self) -> Option<IterMut<'_>> {
+    pub fn try_iter_mut(&mut self) -> Option<IterMut<'_>> {
         let back = self.storage.len();
         // Disjoint fields: `data` borrowed mutably for the iterator, `storage`
         // immutably to drive the entry ranges.
@@ -509,7 +513,7 @@ pub struct StringPodAliasBuilder<'a> {
     positions: Vec<(u32, u32)>,
 }
 
-impl<'a> StringPodAliasBuilder<'a> {
+impl StringPodAliasBuilder<'_> {
     /// Alias the next source entry, taking `source_entry[offset..offset+len]`.
     ///
     /// `offset` and `len` are relative to the visible start of the source
@@ -571,6 +575,7 @@ impl<'a> StringPodAliasBuilder<'a> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason="it's tests")]
 mod tests {
     use super::{StringPod, StringPodBuilder};
     use bstr::BStr;
@@ -1140,7 +1145,7 @@ mod tests {
         bld.push(b("ABC"));
         bld.push(b("XYZ"));
         let mut p = bld.finish();
-        for entry in p.iter_mut().unwrap() {
+        for entry in p.try_iter_mut().unwrap() {
             entry.reverse();
         }
         assert_eq!(p.get(0), BStr::new("CBA"));
@@ -1153,7 +1158,7 @@ mod tests {
         bld.push(b("ABC"));
         let mut p = bld.finish();
         let _q = p.clone();
-        assert!(p.iter_mut().is_none());
+        assert!(p.try_iter_mut().is_none());
     }
 
     #[test]
@@ -1164,7 +1169,7 @@ mod tests {
         bld.push(b("GHI"));
         let mut p = bld.finish();
         {
-            let mut it = p.iter_mut().unwrap();
+            let mut it = p.try_iter_mut().unwrap();
             it.next().unwrap().reverse();       // ABC → CBA
             it.next_back().unwrap().reverse();  // GHI → IHG
             // DEF untouched
@@ -1181,7 +1186,7 @@ mod tests {
         bld.push(b("hi"));
         bld.push(b("foobar"));
         let mut p = bld.finish();
-        for entry in p.iter_mut().unwrap() {
+        for entry in p.try_iter_mut().unwrap() {
             entry.make_ascii_uppercase();
         }
         assert_eq!(p.get(0), BStr::new("HELLO"));
@@ -1199,7 +1204,7 @@ mod tests {
         let mut p = bld.finish();
         p.cut_start(1);
         p.cut_end(1); // visible: "BCDE", "VWXY", "1234"
-        for entry in p.iter_mut().unwrap() {
+        for entry in p.try_iter_mut().unwrap() {
             entry.reverse();
         }
         assert_eq!(p.get(0), BStr::new("EDCB"));
@@ -1223,7 +1228,7 @@ mod tests {
             ab.finish()
         };
         drop(source); // make the shared buffer uniquely owned
-        for entry in aliased.iter_mut().unwrap() {
+        for entry in aliased.try_iter_mut().unwrap() {
             entry.make_ascii_lowercase();
         }
         assert_eq!(aliased.get(0), BStr::new("ell"));
@@ -1239,7 +1244,7 @@ mod tests {
         bld.push(b("gamma"));
         let mut p = bld.finish();
         {
-            let mut it = p.iter_mut().unwrap();
+            let mut it = p.try_iter_mut().unwrap();
             it.next().unwrap().make_ascii_uppercase(); // alpha → ALPHA
             it.next_back().unwrap().make_ascii_uppercase(); // gamma → GAMMA
         }
@@ -1257,7 +1262,7 @@ mod tests {
         bld.push(b("CC"));
         let mut p = bld.finish();
         {
-            let all: Vec<&mut BStr> = p.iter_mut().unwrap().collect();
+            let all: Vec<&mut BStr> = p.try_iter_mut().unwrap().collect();
             assert_eq!(all.len(), 3);
             for entry in all {
                 entry.make_ascii_lowercase();

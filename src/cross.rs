@@ -32,7 +32,7 @@
 //!
 //! ## Mutation
 //!
-//! [`iter_mut`](CrossPodLocations::iter_mut) yields each record assembled into a
+//! [`try_iter_mut`](CrossPodLocations::try_iter_mut) yields each record assembled into a
 //! [`CompanionMut`](CrossPods::CompanionMut) of `&mut BStr`, collectable just
 //! like [`slice::iter_mut`] — and it contains no `unsafe`. Each column buffer is
 //! split into its disjoint parts with [`split_at_mut`](slice::split_at_mut),
@@ -40,7 +40,7 @@
 //! (non-overlapping by construction in the pod builders, by assertion in the
 //! alias builders), so the common indices are trivially disjoint; the one way to
 //! create overlap is aiming two [`part_sub`](CrossPodLocationsBuilder::part_sub)
-//! windows at the *same* entry, which `iter_mut` rejects with a panic.
+//! windows at the *same* entry, which `try_iter_mut` rejects with a panic.
 //! [`for_each_mut`](CrossPodLocations::for_each_mut) is the alternative for that
 //! case: it hands out one part at a time, so it stays sound even with overlap.
 //!
@@ -140,7 +140,7 @@ pub trait CrossPods {
     type Companion<'a>;
 
     /// The mutable counterpart of [`Companion`](Self::Companion), yielded by
-    /// [`CrossPodLocations::iter_mut`].
+    /// [`CrossPodLocations::try_iter_mut`].
     type CompanionMut<'a>;
 
     /// The pods, in fixed order. A [`StringPod`] becomes one column, a
@@ -148,7 +148,7 @@ pub trait CrossPods {
     fn pods(&self) -> SmallVec<[PodRef<'_>; 4]>;
 
     /// The same pods in the same order, mutably. Required for
-    /// [`CrossPodLocations::iter_mut`] / [`for_each_mut`](CrossPodLocations::for_each_mut).
+    /// [`CrossPodLocations::try_iter_mut`] / [`for_each_mut`](CrossPodLocations::for_each_mut).
     fn pods_mut(&mut self) -> SmallVec<[PodMut<'_>; 4]>;
 
     /// Assemble a companion from one record's resolved parts. `parts[k]` is the
@@ -158,7 +158,7 @@ pub trait CrossPods {
     /// Assemble a mutable companion from one record's resolved parts, consuming
     /// them (each `&mut BStr` is moved into a field). Parts are in push order,
     /// the same order as [`to_companion`](Self::to_companion).
-    fn to_companion_mut<'a>(parts: SmallVec<[&'a mut BStr; 4]>) -> Self::CompanionMut<'a>;
+    fn to_companion_mut(parts: SmallVec<[&mut BStr; 4]>) -> Self::CompanionMut<'_>;
 }
 
 // ── column flattening helpers ──────────────────────────────────────────────
@@ -390,10 +390,10 @@ impl CrossPodLocations {
 
     /// Iterate records as companions.
     #[must_use]
-    pub fn iter<'a, T: CrossPods>(&'a self, pods: &'a T) -> Records<'a, T> {
+    pub fn iter<'a, T: CrossPods>(&'a self, pods: &'a T) -> CrossPodRecords<'a, T> {
         let podrefs = pods.pods();
         let colmap = colmap_for(&podrefs);
-        Records {
+        CrossPodRecords {
             records: &self.records,
             pods: podrefs,
             colmap,
@@ -442,7 +442,7 @@ impl CrossPodLocations {
     /// or from whole entries never trip this. Use
     /// [`for_each_mut`](Self::for_each_mut) when you do need overlapping windows.
     #[must_use]
-    pub fn iter_mut<'a, T: CrossPods>(&self, pods: &'a mut T) -> Option<RecordsMut<'a, T>> {
+    pub fn try_iter_mut<'a, T: CrossPods>(&self, pods: &'a mut T) -> Option<RecordsMut<'a, T>> {
         let views = column_views_mut(pods.pods_mut())?;
 
         // For each column, gather the (start, len) of every part that lands in
@@ -559,7 +559,7 @@ impl CrossPodLocations {
 
 /// Iterator over [`CrossPodLocations`] records as companions. Created by
 /// [`CrossPodLocations::iter`].
-pub struct Records<'a, T: CrossPods> {
+pub struct CrossPodRecords<'a, T: CrossPods> {
     records: &'a [SmallVec<[Location; 4]>],
     pods: SmallVec<[PodRef<'a>; 4]>,
     colmap: SmallVec<[(usize, Sub); 4]>,
@@ -567,7 +567,7 @@ pub struct Records<'a, T: CrossPods> {
     _marker: PhantomData<fn() -> T>,
 }
 
-impl<'a, T: CrossPods> Iterator for Records<'a, T> {
+impl<'a, T: CrossPods> Iterator for CrossPodRecords<'a, T> {
     type Item = T::Companion<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -586,7 +586,7 @@ impl<'a, T: CrossPods> Iterator for Records<'a, T> {
     }
 }
 
-impl<T: CrossPods> ExactSizeIterator for Records<'_, T> {}
+impl<T: CrossPods> ExactSizeIterator for CrossPodRecords<'_, T> {}
 
 /// Iterator over [`CrossPodLocations`] records as mutable companions. Created
 /// by [`CrossPodLocations::iter_mut`].
@@ -725,6 +725,7 @@ impl<'t> CrossPodLocationsBuilder<'t> {
 // ── tests ────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason="it's tests")]
 mod tests {
     use super::{CrossPodLocations, CrossPods, Pod, PodMut, PodRef};
     use crate::dual::{DualStringPod, DualStringPodBuilder};
@@ -788,13 +789,13 @@ mod tests {
             }
         }
 
-        fn to_companion_mut<'a>(parts: SmallVec<[&'a mut BStr; 4]>) -> FastQReadMut<'a> {
+        fn to_companion_mut(parts: SmallVec<[&mut BStr; 4]>) -> FastQReadMut<'_> {
             let mut it = parts.into_iter();
             FastQReadMut {
-                name: it.next().unwrap(),
-                seq: it.next().unwrap(),
-                qual: it.next().unwrap(),
-                plus: it.next().unwrap(),
+                name: it.next().expect("Length is known"),
+                seq: it.next().expect("Length is known"),
+                qual: it.next().expect("Length is known"),
+                plus: it.next().expect("Length is known"),
             }
         }
     }
@@ -844,7 +845,7 @@ mod tests {
     fn get_resolves_named_companion() {
         let chunk = chunk();
         let locs = CrossPodLocations::per_row(&chunk);
-        let read = locs.get(&chunk, 1).unwrap();
+        let read = locs.get(&chunk, 1).expect("can't fail");
         assert_eq!(
             read,
             FastQRead {
@@ -945,7 +946,7 @@ mod tests {
         let mut chunk = chunk();
         let locs = CrossPodLocations::per_row(&chunk);
         {
-            let mut it = locs.iter_mut(&mut chunk).unwrap();
+            let mut it = locs.try_iter_mut(&mut chunk).unwrap();
             assert_eq!(it.len(), 2);
             for read in &mut it {
                 // All four parts are available as named fields at once.
@@ -972,7 +973,7 @@ mod tests {
         let mut chunk = chunk();
         let locs = CrossPodLocations::per_row(&chunk);
         {
-            let reads: Vec<FastQReadMut<'_>> = locs.iter_mut(&mut chunk).unwrap().collect();
+            let reads: Vec<FastQReadMut<'_>> = locs.try_iter_mut(&mut chunk).unwrap().collect();
             assert_eq!(reads.len(), 2);
             for read in reads {
                 read.name.make_ascii_lowercase();
@@ -989,7 +990,7 @@ mod tests {
         let mut chunk = chunk();
         let locs = CrossPodLocations::per_row(&chunk);
         let _shared = chunk.seq_qual.clone();
-        assert!(locs.iter_mut(&mut chunk).is_none());
+        assert!(locs.try_iter_mut(&mut chunk).is_none());
     }
 
     #[test]
@@ -1004,7 +1005,7 @@ mod tests {
             builder.commit();
             builder.finish()
         };
-        let _ = locs.iter_mut(&mut chunk);
+        let _ = locs.try_iter_mut(&mut chunk);
     }
 
     #[test]
@@ -1021,7 +1022,7 @@ mod tests {
             builder.finish()
         };
         {
-            let mut it = locs.iter_mut(&mut cols).unwrap();
+            let mut it = locs.try_iter_mut(&mut cols).unwrap();
             let mut record = it.next().unwrap();
             record[0].copy_from_slice(b"xx");
             record[1].copy_from_slice(b"yy");

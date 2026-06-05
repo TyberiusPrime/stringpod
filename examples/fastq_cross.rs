@@ -65,7 +65,7 @@ impl CrossPods for FastQChunk {
         }
     }
 
-    fn to_companion_mut<'a>(parts: SmallVec<[&'a mut BStr; 4]>) -> FastQReadMut<'a> {
+    fn to_companion_mut(parts: SmallVec<[& mut BStr; 4]>) -> FastQReadMut<'_> {
         let mut it = parts.into_iter();
         FastQReadMut {
             name: it.next().expect("name part"),
@@ -125,7 +125,7 @@ fn main() {
     // slice::iter_mut.
     {
         let it = locs
-            .iter_mut(&mut chunk)
+            .try_iter_mut(&mut chunk)
             .expect("buffers were uniquely owned");
         for read in it {
             read.name.make_ascii_uppercase();
