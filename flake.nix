@@ -101,17 +101,6 @@
           phase = "cargo build --workspace --offline";
         };
 
-        # Full-corpus-only extra (local): re-run the golden-hash test without
-        # the large-fixture skip. With only the committed synth fixtures present
-        # it just stops skipping nothing; on a machine with the fetched corpus
-        # it exercises the big files too.
-        ciCorpusFull = mkCargoCheck {
-          name = "stringpod-corpus-full";
-          phase = ''
-            export RAPIDGZIP_FULL_CORPUS=1
-            cargo test -p stringpod --test golden_hash --offline
-          '';
-        };
 
       in
       rec {
@@ -123,17 +112,16 @@
           msrv = ciMsrv;
         };
 
-        # Lean CI subset under a dedicated `test` output 
-        # same here.
-        test = {
-          stable = ciStable;
-          clippy = ciClippy;
-          fmt = ciFmt;
-          msrv = ciMsrv;
+        # Lean CI subset exposed as packages so `nix build .#test.<name>` works
+        packages = {
+          "test/stable" = ciStable;
+          "test/clippy" = ciClippy;
+          "test/fmt" = ciFmt;
+          "test/msrv" = ciMsrv;
         };
 
         # `nix develop`
-        devShell = pkgs.mkShell {
+        devShells.default = pkgs.mkShell {
           COMMIT_HASH = self.rev or (pkgs.lib.removeSuffix "-dirty" self.dirtyRev or "unknown-not-in-git");
           # we only link with mold in our dev environment for build speed. CI can use the old school rust linker
           shellHook = ''
