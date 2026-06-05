@@ -112,12 +112,12 @@
           msrv = ciMsrv;
         };
 
-        # Lean CI subset exposed as packages so `nix build .#test.<name>` works
-        packages = {
-          "test/stable" = ciStable;
-          "test/clippy" = ciClippy;
-          "test/fmt" = ciFmt;
-          "test/msrv" = ciMsrv;
+        # Lean CI subset: `nix build .#test.<name>` (used by GitHub CI matrix)
+        test = {
+          stable = ciStable;
+          clippy = ciClippy;
+          fmt = ciFmt;
+          msrv = ciMsrv;
         };
 
         # `nix develop`
