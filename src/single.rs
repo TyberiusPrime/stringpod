@@ -1,4 +1,5 @@
-use bstr::BStr;
+use bstr::{BStr, ByteSlice as _};
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -42,6 +43,19 @@ impl StringPod {
     pub fn get(&self, i: usize) -> &BStr {
         let range = self.storage.entry_range(i);
         BStr::new(&self.data[range])
+    }
+
+    /// Get entry `i` as `&mut BStr`, or `None` if the byte buffer is shared
+    /// (Arc strong count > 1). When `None` is returned the buffer has multiple
+    /// owners; drop or release the other references before retrying, or rebuild
+    /// the pod into a fresh buffer.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    pub fn get_mut(&mut self, i: usize) -> Option<&mut BStr> {
+        let data = Arc::get_mut(&mut self.data)?;
+        let range = self.storage.entry_range(i);
+        Some(data[range].as_bstr_mut())
     }
 
     /// Visible length of entry `i` (after cuts).
@@ -151,6 +165,94 @@ impl StringPod {
         }
     }
 
+    /// Prepend `text` to every entry, rebuilding the byte buffer.
+    ///
+    /// Preserves `FixedLength` storage when all input entries have equal
+    /// length (since the prefix is uniform, the output stride is uniform too).
+    #[must_use]
+    pub fn prefix(self, text: &[u8]) -> Self {
+        let n = self.len();
+        let first_len = if n > 0 { self.entry_len(0) + text.len() } else { text.len() };
+        let mut bld = StringPodBuilder::with_capacity(first_len, n);
+        let mut buf = Vec::with_capacity(first_len);
+        for i in 0..n {
+            buf.clear();
+            buf.extend_from_slice(text);
+            buf.extend_from_slice(self.get(i));
+            bld.push(&buf);
+        }
+        bld.finish()
+    }
+
+    /// Append `text` to every entry, rebuilding the byte buffer.
+    ///
+    /// Preserves `FixedLength` storage when all input entries have equal
+    /// length.
+    #[must_use]
+    pub fn postfix(self, text: &[u8]) -> Self {
+        let n = self.len();
+        let first_len = if n > 0 { self.entry_len(0) + text.len() } else { text.len() };
+        let mut bld = StringPodBuilder::with_capacity(first_len, n);
+        let mut buf = Vec::with_capacity(first_len);
+        for i in 0..n {
+            buf.clear();
+            buf.extend_from_slice(self.get(i));
+            buf.extend_from_slice(text);
+            bld.push(&buf);
+        }
+        bld.finish()
+    }
+
+    /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
+    /// pods; rebuilds the buffer for `Variable` pods (entries may need to be
+    /// clipped by different amounts).
+    #[must_use]
+    pub fn max_len(mut self, n: usize) -> Self {
+        if let Storage::FixedLength { visible_len, .. } = self.storage {
+            let vl = visible_len as usize;
+            if vl > n {
+                self.cut_end(vl - n);
+            }
+            return self;
+        }
+        let count = self.len();
+        let mut bld = StringPodBuilder::with_capacity(n, count);
+        for i in 0..count {
+            let entry = self.get(i);
+            bld.push(&entry[..entry.len().min(n)]);
+        }
+        bld.finish()
+    }
+
+    /// Reverse the bytes of every entry in-place. If the byte buffer is
+    /// shared (Arc strong count > 1) it is cloned before reversing (COW).
+    #[must_use]
+    pub fn reverse(mut self) -> Self {
+        if Arc::get_mut(&mut self.data).is_none() {
+            self.data = Arc::new((*self.data).clone());
+        }
+        let data = Arc::get_mut(&mut self.data).expect("just ensured unique");
+        let n = self.storage.len();
+        for i in 0..n {
+            let r = self.storage.entry_range(i);
+            data[r].reverse();
+        }
+        self
+    }
+
+    /// Returns a mutable iterator over entries, or `None` if the byte buffer
+    /// is shared (Arc strong count > 1).
+    pub fn iter_mut(&mut self) -> Option<IterMut<'_>> {
+        let ptr = Arc::get_mut(&mut self.data)?.as_mut_ptr();
+        Some(IterMut {
+            data: ptr,
+            storage: &self.storage,
+            front: 0,
+            back: self.storage.len(),
+            _marker: PhantomData,
+        })
+    }
+
     /// Iterate visible entries as `&BStr` in order.
     #[must_use]
     pub fn iter(&self) -> Iter<'_> {
@@ -164,10 +266,14 @@ impl StringPod {
     /// Start an alias builder that shares this pod's byte buffer. New entries
     /// pushed via the alias builder will reference bytes inside `self.data`
     /// without copying.
+    ///
+    /// The builder borrows `self` until [`StringPodAliasBuilder::finish`] is
+    /// called; the source pod cannot be mutated while the builder is live.
     #[must_use]
-    pub fn alias_builder(&self) -> StringPodAliasBuilder {
+    pub fn alias_builder(&self) -> StringPodAliasBuilder<'_> {
         StringPodAliasBuilder {
-            data: Arc::clone(&self.data),
+            source: self,
+            next: 0,
             positions: Vec::new(),
         }
     }
@@ -227,6 +333,58 @@ impl DoubleEndedIterator for Iter<'_> {
 }
 
 impl ExactSizeIterator for Iter<'_> {}
+
+pub struct IterMut<'a> {
+    data: *mut u8,
+    storage: &'a Storage,
+    front: usize,
+    back: usize,
+    _marker: PhantomData<&'a mut u8>,
+}
+
+// Safety: `IterMut` holds exclusive access (via `Arc::get_mut`) to the
+// underlying buffer, mirroring `slice::IterMut`.
+unsafe impl Send for IterMut<'_> {}
+unsafe impl Sync for IterMut<'_> {}
+
+impl<'a> Iterator for IterMut<'a> {
+    type Item = &'a mut BStr;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        let r = self.storage.entry_range(self.front);
+        self.front += 1;
+        // Safety: each entry range is visited at most once (front is
+        // monotone increasing). `data` was obtained via `Arc::get_mut`,
+        // guaranteeing exclusive buffer access. Builder-built entries are
+        // non-overlapping by construction.
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.data.add(r.start), r.end - r.start)
+                .as_bstr_mut()
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = self.back - self.front;
+        (r, Some(r))
+    }
+}
+
+impl DoubleEndedIterator for IterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        self.back -= 1;
+        let r = self.storage.entry_range(self.back);
+        Some(unsafe {
+            std::slice::from_raw_parts_mut(self.data.add(r.start), r.end - r.start)
+                .as_bstr_mut()
+        })
+    }
+}
+
+impl ExactSizeIterator for IterMut<'_> {}
 
 // ── owning builder ───────────────────────────────────────────────────────
 
@@ -311,33 +469,52 @@ impl StringPodBuilder {
 // ── alias builder ────────────────────────────────────────────────────────
 
 /// Builds a [`StringPod`] whose entries reference bytes in an existing pod's
-/// `Arc<[u8]>` without copying. The resulting pod co-owns the source bytes;
-/// subsequent mutations of the source pod do not affect the alias pod
-/// (snapshot semantics).
-pub struct StringPodAliasBuilder {
-    data: Arc<Vec<u8>>,
+/// `Arc<[u8]>` without copying.
+///
+/// Each [`push_alias`](StringPodAliasBuilder::push_alias) call consumes the
+/// *next* source entry in order, so aliases are guaranteed to be
+/// non-overlapping (they are sub-ranges of distinct, non-overlapping source
+/// entries). At most `source.len()` aliases may be pushed.
+///
+/// The source pod is borrowed for the builder's lifetime and released on
+/// [`finish`](StringPodAliasBuilder::finish). The resulting pod co-owns the
+/// source bytes; subsequent mutations of the source pod do not affect the
+/// alias pod (snapshot semantics).
+pub struct StringPodAliasBuilder<'a> {
+    source: &'a StringPod,
+    next: usize,
     positions: Vec<(u32, u32)>,
 }
 
-impl StringPodAliasBuilder {
-    /// Record an alias entry covering `data[start..start+len]` of the source.
+impl<'a> StringPodAliasBuilder<'a> {
+    /// Alias the next source entry, taking `source_entry[offset..offset+len]`.
+    ///
+    /// `offset` and `len` are relative to the visible start of the source
+    /// entry (after any `cut_start` / `cut_end` overlays).
     ///
     /// # Panics
-    /// If the range is out of bounds of the source buffer, or exceeds `u32`.
-    pub fn push_alias(&mut self, start: usize, len: usize) {
-        let start_u32 = u32::try_from(start).expect("alias start exceeds u32");
-        let len_u32 = u32::try_from(len).expect("alias len exceeds u32");
-        let stop_u32 = start_u32
-            .checked_add(len_u32)
-            .expect("alias start + len exceeds u32");
+    /// - If all source entries have already been consumed.
+    /// - If `offset + len > source.entry_len(next)`.
+    /// - If any computed byte position would exceed `u32::MAX`.
+    pub fn push_alias(&mut self, offset: usize, len: usize) {
         assert!(
-            (stop_u32 as usize) <= self.data.len(),
-            "alias range {}..{} out of source bounds (len {})",
-            start,
-            start + len,
-            self.data.len()
+            self.next < self.source.len(),
+            "alias builder: all {} source entries already consumed",
+            self.source.len(),
         );
-        self.positions.push((start_u32, stop_u32));
+        let r = self.source.storage.entry_range(self.next);
+        let entry_len = r.end - r.start;
+        let end = offset
+            .checked_add(len)
+            .expect("alias offset + len overflows usize");
+        assert!(
+            end <= entry_len,
+            "alias offset {offset}+len {len}={end} exceeds entry length {entry_len}",
+        );
+        let abs_start = u32::try_from(r.start + offset).expect("alias start exceeds u32");
+        let abs_end = u32::try_from(r.start + end).expect("alias end exceeds u32");
+        self.positions.push((abs_start, abs_end));
+        self.next += 1;
     }
 
     /// Number of alias entries pushed so far.
@@ -351,13 +528,13 @@ impl StringPodAliasBuilder {
         self.positions.is_empty()
     }
 
-    /// Finalise the alias builder. The resulting pod always has Variable
-    /// storage (entries reference arbitrary, potentially non-contiguous
-    /// regions of the shared buffer).
+    /// Finalise the alias builder, releasing the borrow of the source pod.
+    /// The resulting pod always has `Variable` storage (entries reference
+    /// non-contiguous regions of the shared buffer).
     #[must_use]
     pub fn finish(self) -> StringPod {
         StringPod {
-            data: self.data,
+            data: Arc::clone(&self.source.data),
             storage: Storage::Variable {
                 positions: self.positions,
                 head_skip: 0,
@@ -656,18 +833,20 @@ mod tests {
 
     #[test]
     fn alias_builder_basic() {
-        let mut bld = StringPodBuilder::with_capacity(0, 1);
-        bld.push(b("HELLOWORLD"));
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("FOOBAR"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
-        ab.push_alias(0, 5); // "HELLO"
-        ab.push_alias(5, 5); // "WORLD"
-        ab.push_alias(2, 3); // "LLO"
+        ab.push_alias(1, 3); // entry 0 "HELLO"  → "ELL"
+        ab.push_alias(0, 5); // entry 1 "WORLD"  → "WORLD"
+        ab.push_alias(2, 3); // entry 2 "FOOBAR" → "OBA"
         let aliased = ab.finish();
         assert_eq!(aliased.len(), 3);
-        assert_eq!(aliased.get(0), BStr::new("HELLO"));
+        assert_eq!(aliased.get(0), BStr::new("ELL"));
         assert_eq!(aliased.get(1), BStr::new("WORLD"));
-        assert_eq!(aliased.get(2), BStr::new("LLO"));
+        assert_eq!(aliased.get(2), BStr::new("OBA"));
     }
 
     #[test]
@@ -676,19 +855,32 @@ mod tests {
         bld.push(b("hello"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
-        ab.push_alias(3, 0);
+        ab.push_alias(3, 0); // entry 0 "hello", offset 3, len 0 → ""
         let aliased = ab.finish();
         assert_eq!(aliased.get(0), BStr::new(""));
     }
 
     #[test]
-    #[should_panic(expected = "out of source bounds")]
+    #[should_panic(expected = "exceeds entry")]
     fn alias_builder_out_of_bounds_panics() {
         let mut bld = StringPodBuilder::with_capacity(0, 1);
         bld.push(b("hello"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
-        ab.push_alias(3, 10);
+        ab.push_alias(3, 10); // offset 3 + len 10 = 13 > entry len 5
+    }
+
+    #[test]
+    #[should_panic(expected = "already consumed")]
+    fn alias_builder_too_many_entries_panics() {
+        let mut bld = StringPodBuilder::with_capacity(0, 2);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        let source = bld.finish();
+        let mut ab = source.alias_builder();
+        ab.push_alias(0, 2);
+        ab.push_alias(0, 2);
+        ab.push_alias(0, 1); // third push on a 2-entry source — panics
     }
 
     #[test]
@@ -698,14 +890,18 @@ mod tests {
         bld.push(b("BBB"));
         bld.push(b("CCC"));
         let mut source = bld.finish();
-        let mut ab = source.alias_builder();
-        ab.push_alias(3, 3); // points at "BBB"
-        let aliased = ab.finish();
+        let aliased = {
+            let mut ab = source.alias_builder();
+            ab.push_alias(0, 3); // entry 0 "AAA" → "AAA"
+            ab.push_alias(0, 3); // entry 1 "BBB" → "BBB"
+            ab.finish()
+        };
         // Mutate source — drain promotes and drops entry 1
         source.drain(1..2);
         assert_eq!(source.len(), 2);
         // Alias still sees original bytes
-        assert_eq!(aliased.get(0), BStr::new("BBB"));
+        assert_eq!(aliased.get(0), BStr::new("AAA"));
+        assert_eq!(aliased.get(1), BStr::new("BBB"));
     }
 
     #[test]
@@ -713,9 +909,11 @@ mod tests {
         let mut bld = StringPodBuilder::with_capacity(0, 1);
         bld.push(b("ABCDEFGH"));
         let mut source = bld.finish();
-        let mut ab = source.alias_builder();
-        ab.push_alias(0, 8);
-        let aliased = ab.finish();
+        let aliased = {
+            let mut ab = source.alias_builder();
+            ab.push_alias(0, 8); // entry 0, full range
+            ab.finish()
+        };
         source.cut_start(3);
         source.cut_end(3);
         // Source is now "DE" visible
@@ -808,12 +1006,189 @@ mod tests {
         assert!(s.contains("StringPod"));
     }
 
+    // ── prefix / postfix ──────────────────────────────────────────────────
+
+    #[test]
+    fn prefix_fixed_prepends_and_stays_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        let p = bld.finish().prefix(b("XX"));
+        assert!(p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("XXAAA"));
+        assert_eq!(p.get(1), BStr::new("XXBBB"));
+    }
+
+    #[test]
+    fn prefix_variable_prepends() {
+        let mut bld = StringPodBuilder::with_capacity(0, 2);
+        bld.push(b("hello"));
+        bld.push(b("hi"));
+        let p = bld.finish().prefix(b("--"));
+        assert_eq!(p.get(0), BStr::new("--hello"));
+        assert_eq!(p.get(1), BStr::new("--hi"));
+    }
+
+    #[test]
+    fn postfix_fixed_appends_and_stays_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        let p = bld.finish().postfix(b("ZZ"));
+        assert!(p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("AAAZZ"));
+        assert_eq!(p.get(1), BStr::new("BBBZZ"));
+    }
+
+    #[test]
+    fn postfix_variable_appends() {
+        let mut bld = StringPodBuilder::with_capacity(0, 2);
+        bld.push(b("hello"));
+        bld.push(b("hi"));
+        let p = bld.finish().postfix(b("!!"));
+        assert_eq!(p.get(0), BStr::new("hello!!"));
+        assert_eq!(p.get(1), BStr::new("hi!!"));
+    }
+
+    // ── max_len ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn max_len_fixed_noop_when_under() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        let p = bld.finish().max_len(5);
+        assert!(p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("AAA"));
+    }
+
+    #[test]
+    fn max_len_fixed_clips() {
+        let mut bld = StringPodBuilder::with_capacity(5, 2);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        let p = bld.finish().max_len(3);
+        assert!(p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("HEL"));
+        assert_eq!(p.get(1), BStr::new("WOR"));
+    }
+
+    #[test]
+    fn max_len_variable_clips_each_entry() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("ABCDE")); // 5 → 3
+        bld.push(b("AB"));    // 2, already ≤ 3
+        bld.push(b("ABCDEFG")); // 7 → 3
+        let p = bld.finish().max_len(3);
+        assert_eq!(p.get(0), BStr::new("ABC"));
+        assert_eq!(p.get(1), BStr::new("AB"));
+        assert_eq!(p.get(2), BStr::new("ABC"));
+    }
+
+    // ── reverse ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn reverse_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("ABC"));
+        bld.push(b("XYZ"));
+        let p = bld.finish().reverse();
+        assert_eq!(p.get(0), BStr::new("CBA"));
+        assert_eq!(p.get(1), BStr::new("ZYX"));
+    }
+
+    #[test]
+    fn reverse_cow_clones_shared_arc() {
+        let mut bld = StringPodBuilder::with_capacity(3, 1);
+        bld.push(b("ABC"));
+        let p = bld.finish();
+        let q = p.clone(); // bump Arc refcount
+        let r = p.reverse(); // COW — must clone
+        // Original clone still sees "ABC"
+        assert_eq!(q.get(0), BStr::new("ABC"));
+        assert_eq!(r.get(0), BStr::new("CBA"));
+    }
+
+    // ── iter_mut ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn iter_mut_allows_in_place_mutation() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("ABC"));
+        bld.push(b("XYZ"));
+        let mut p = bld.finish();
+        for entry in p.iter_mut().unwrap() {
+            entry.reverse();
+        }
+        assert_eq!(p.get(0), BStr::new("CBA"));
+        assert_eq!(p.get(1), BStr::new("ZYX"));
+    }
+
+    #[test]
+    fn iter_mut_returns_none_when_shared() {
+        let mut bld = StringPodBuilder::with_capacity(3, 1);
+        bld.push(b("ABC"));
+        let mut p = bld.finish();
+        let _q = p.clone();
+        assert!(p.iter_mut().is_none());
+    }
+
+    #[test]
+    fn iter_mut_double_ended() {
+        let mut bld = StringPodBuilder::with_capacity(3, 3);
+        bld.push(b("ABC"));
+        bld.push(b("DEF"));
+        bld.push(b("GHI"));
+        let mut p = bld.finish();
+        {
+            let mut it = p.iter_mut().unwrap();
+            it.next().unwrap().reverse();       // ABC → CBA
+            it.next_back().unwrap().reverse();  // GHI → IHG
+            // DEF untouched
+        }
+        assert_eq!(p.get(0), BStr::new("CBA"));
+        assert_eq!(p.get(1), BStr::new("DEF"));
+        assert_eq!(p.get(2), BStr::new("IHG"));
+    }
+
+    #[test]
+    fn get_mut_exclusive_succeeds() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        let mut p = bld.finish();
+        p.get_mut(0).unwrap().copy_from_slice(b("ZZZ"));
+        assert_eq!(p.get(0), BStr::new("ZZZ"));
+        assert_eq!(p.get(1), BStr::new("BBB"));
+    }
+
+    #[test]
+    fn get_mut_shared_returns_none() {
+        let mut bld = StringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"));
+        let mut p = bld.finish();
+        let _q = p.clone();
+        assert!(p.get_mut(0).is_none());
+    }
+
+    #[test]
+    fn get_mut_succeeds_after_shared_ref_dropped() {
+        let mut bld = StringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"));
+        let mut p = bld.finish();
+        {
+            let _q = p.clone(); // bumps refcount to 2
+        } // _q drops here — refcount back to 1
+        p.get_mut(0).unwrap().copy_from_slice(b("ZZZ"));
+        assert_eq!(p.get(0), BStr::new("ZZZ"));
+    }
+
     // compile-time check: pods are Send+Sync
     #[test]
     fn send_sync_check() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<StringPod>();
         assert_send_sync::<super::StringPodBuilder>();
-        assert_send_sync::<super::StringPodAliasBuilder>();
+        assert_send_sync::<super::StringPodAliasBuilder<'static>>();
     }
 }

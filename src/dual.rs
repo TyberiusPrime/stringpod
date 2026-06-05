@@ -1,4 +1,5 @@
-use bstr::BStr;
+use bstr::{BStr, ByteSlice as _};
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -223,6 +224,32 @@ impl DualStringPod {
         )
     }
 
+    /// Mutable access to the sequence bytes of entry `i`, or `None` if the
+    /// sequence buffer is shared (Arc strong count > 1). Drop or release other
+    /// references before retrying, or rebuild into a fresh pod.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    pub fn seq_mut(&mut self, i: usize) -> Option<&mut BStr> {
+        let data = Arc::get_mut(&mut self.seq)?;
+        let r = self.storage.entry_range(i);
+        let range = (r.start + self.seq_first_byte)..(r.end + self.seq_first_byte);
+        Some(data[range].as_bstr_mut())
+    }
+
+    /// Mutable access to the quality bytes of entry `i`, or `None` if the
+    /// quality buffer is shared (Arc strong count > 1). Drop or release other
+    /// references before retrying, or rebuild into a fresh pod.
+    ///
+    /// # Panics
+    /// If `i >= self.len()`.
+    pub fn qual_mut(&mut self, i: usize) -> Option<&mut BStr> {
+        let data = Arc::get_mut(&mut self.qual)?;
+        let r = self.storage.entry_range(i);
+        let range = (r.start + self.qual_first_byte)..(r.end + self.qual_first_byte);
+        Some(data[range].as_bstr_mut())
+    }
+
     #[must_use]
     pub fn entry_len(&self, i: usize) -> usize {
         self.storage.entry_len(i)
@@ -291,12 +318,148 @@ impl DualStringPod {
         }
     }
 
-    /// Start an alias builder sharing both byte buffers.
+    /// Prepend `seq_text` / `qual_text` to every entry in the respective
+    /// columns, rebuilding both buffers. The two texts must have the same
+    /// length (so the `seq.len() == qual.len()` invariant is preserved).
+    ///
+    /// # Panics
+    /// If `seq_text.len() != qual_text.len()`.
     #[must_use]
-    pub fn alias_builder(&self) -> DualStringPodAliasBuilder {
+    pub fn prefix(self, seq_text: &[u8], qual_text: &[u8]) -> Self {
+        assert_eq!(
+            seq_text.len(),
+            qual_text.len(),
+            "seq_text.len() {} != qual_text.len() {}",
+            seq_text.len(),
+            qual_text.len()
+        );
+        let n = self.len();
+        let first_len = if n > 0 { self.entry_len(0) + seq_text.len() } else { seq_text.len() };
+        let mut bld = DualStringPodBuilder::with_capacity(first_len, n);
+        let mut seq_buf = Vec::with_capacity(first_len);
+        let mut qual_buf = Vec::with_capacity(first_len);
+        for i in 0..n {
+            seq_buf.clear();
+            seq_buf.extend_from_slice(seq_text);
+            seq_buf.extend_from_slice(self.seq(i));
+            qual_buf.clear();
+            qual_buf.extend_from_slice(qual_text);
+            qual_buf.extend_from_slice(self.qual(i));
+            bld.push(&seq_buf, &qual_buf);
+        }
+        bld.finish()
+    }
+
+    /// Append `seq_text` / `qual_text` to every entry in the respective
+    /// columns, rebuilding both buffers. The two texts must have the same
+    /// length.
+    ///
+    /// # Panics
+    /// If `seq_text.len() != qual_text.len()`.
+    #[must_use]
+    pub fn postfix(self, seq_text: &[u8], qual_text: &[u8]) -> Self {
+        assert_eq!(
+            seq_text.len(),
+            qual_text.len(),
+            "seq_text.len() {} != qual_text.len() {}",
+            seq_text.len(),
+            qual_text.len()
+        );
+        let n = self.len();
+        let first_len = if n > 0 { self.entry_len(0) + seq_text.len() } else { seq_text.len() };
+        let mut bld = DualStringPodBuilder::with_capacity(first_len, n);
+        let mut seq_buf = Vec::with_capacity(first_len);
+        let mut qual_buf = Vec::with_capacity(first_len);
+        for i in 0..n {
+            seq_buf.clear();
+            seq_buf.extend_from_slice(self.seq(i));
+            seq_buf.extend_from_slice(seq_text);
+            qual_buf.clear();
+            qual_buf.extend_from_slice(self.qual(i));
+            qual_buf.extend_from_slice(qual_text);
+            bld.push(&seq_buf, &qual_buf);
+        }
+        bld.finish()
+    }
+
+    /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
+    /// pods; rebuilds both buffers for `Variable` pods.
+    #[must_use]
+    pub fn max_len(mut self, n: usize) -> Self {
+        if let Storage::FixedLength { visible_len, .. } = self.storage {
+            let vl = visible_len as usize;
+            if vl > n {
+                self.cut_end(vl - n);
+            }
+            return self;
+        }
+        let count = self.len();
+        let mut bld = DualStringPodBuilder::with_capacity(n, count);
+        let mut seq_buf = Vec::with_capacity(n);
+        let mut qual_buf = Vec::with_capacity(n);
+        for i in 0..count {
+            let s = self.seq(i);
+            let q = self.qual(i);
+            let len = s.len().min(n);
+            seq_buf.clear();
+            seq_buf.extend_from_slice(&s[..len]);
+            qual_buf.clear();
+            qual_buf.extend_from_slice(&q[..len]);
+            bld.push(&seq_buf, &qual_buf);
+        }
+        bld.finish()
+    }
+
+    /// Reverse the bytes of every entry in both columns in-place. If either
+    /// buffer is shared (Arc strong count > 1) it is cloned before reversing
+    /// (COW).
+    #[must_use]
+    pub fn reverse(mut self) -> Self {
+        if Arc::get_mut(&mut self.seq).is_none() {
+            self.seq = Arc::new((*self.seq).clone());
+        }
+        if Arc::get_mut(&mut self.qual).is_none() {
+            self.qual = Arc::new((*self.qual).clone());
+        }
+        let seq_first_byte = self.seq_first_byte;
+        let qual_first_byte = self.qual_first_byte;
+        let n = self.storage.len();
+        let seq = Arc::get_mut(&mut self.seq).expect("just ensured unique");
+        let qual = Arc::get_mut(&mut self.qual).expect("just ensured unique");
+        for i in 0..n {
+            let r = self.storage.entry_range(i);
+            seq[r.start + seq_first_byte..r.end + seq_first_byte].reverse();
+            qual[r.start + qual_first_byte..r.end + qual_first_byte].reverse();
+        }
+        self
+    }
+
+    /// Returns a mutable iterator over seq+qual entry pairs, or `None` if
+    /// either byte buffer is shared (Arc strong count > 1).
+    pub fn iter_mut(&mut self) -> Option<DualIterMut<'_>> {
+        let seq_ptr = Arc::get_mut(&mut self.seq)?.as_mut_ptr();
+        let qual_ptr = Arc::get_mut(&mut self.qual)?.as_mut_ptr();
+        Some(DualIterMut {
+            seq_data: seq_ptr,
+            qual_data: qual_ptr,
+            storage: &self.storage,
+            seq_first_byte: self.seq_first_byte,
+            qual_first_byte: self.qual_first_byte,
+            front: 0,
+            back: self.storage.len(),
+            _marker: PhantomData,
+        })
+    }
+
+    /// Start an alias builder sharing both byte buffers.
+    ///
+    /// The builder borrows `self` until [`DualStringPodAliasBuilder::finish`]
+    /// is called; the source pod cannot be mutated while the builder is live.
+    #[must_use]
+    pub fn alias_builder(&self) -> DualStringPodAliasBuilder<'_> {
         DualStringPodAliasBuilder {
-            seq: Arc::clone(&self.seq),
-            qual: Arc::clone(&self.qual),
+            source: self,
+            next: 0,
             positions: Vec::new(),
         }
     }
@@ -314,11 +477,16 @@ impl std::fmt::Debug for DualStringPod {
 }
 
 impl<'a> IntoIterator for &'a DualStringPod {
-    type Item = (&'a BStr, &'a BStr);
+    type Item = DualEntry<'a>;
     type IntoIter = Iter<'a>;
     fn into_iter(self) -> Iter<'a> {
         self.iter()
     }
+}
+
+pub struct DualEntry<'a> {
+    pub seq: &'a BStr,
+    pub qual: &'a BStr,
 }
 
 pub struct Iter<'a> {
@@ -328,12 +496,12 @@ pub struct Iter<'a> {
 }
 
 impl<'a> Iterator for Iter<'a> {
-    type Item = (&'a BStr, &'a BStr);
+    type Item = DualEntry<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.front < self.back {
-            let p = self.pod.pair(self.front);
+            let (seq, qual) = self.pod.pair(self.front);
             self.front += 1;
-            Some(p)
+            Some(DualEntry { seq, qual })
         } else {
             None
         }
@@ -348,7 +516,8 @@ impl DoubleEndedIterator for Iter<'_> {
     fn next_back(&mut self) -> Option<Self::Item> {
         if self.front < self.back {
             self.back -= 1;
-            Some(self.pod.pair(self.back))
+            let (seq, qual) = self.pod.pair(self.back);
+            Some(DualEntry { seq, qual })
         } else {
             None
         }
@@ -406,6 +575,79 @@ impl<'a> Iterator for QualIter<'a> {
 }
 
 impl ExactSizeIterator for QualIter<'_> {}
+
+pub struct DualEntryMut<'a> {
+    pub seq: &'a mut BStr,
+    pub qual: &'a mut BStr,
+}
+
+pub struct DualIterMut<'a> {
+    seq_data: *mut u8,
+    qual_data: *mut u8,
+    storage: &'a Storage,
+    seq_first_byte: usize,
+    qual_first_byte: usize,
+    front: usize,
+    back: usize,
+    _marker: PhantomData<&'a mut u8>,
+}
+
+// Safety: `DualIterMut` holds exclusive access (via `Arc::get_mut`) to both
+// underlying buffers, mirroring `slice::IterMut`.
+unsafe impl Send for DualIterMut<'_> {}
+unsafe impl Sync for DualIterMut<'_> {}
+
+impl<'a> Iterator for DualIterMut<'a> {
+    type Item = DualEntryMut<'a>;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        let r = self.storage.entry_range(self.front);
+        self.front += 1;
+        let seq_start = r.start + self.seq_first_byte;
+        let qual_start = r.start + self.qual_first_byte;
+        let len = r.end - r.start;
+        // Safety: each entry range is visited at most once (front is
+        // monotone increasing). Both `seq_data` and `qual_data` were
+        // obtained via `Arc::get_mut`, guaranteeing exclusive buffer access.
+        Some(unsafe {
+            DualEntryMut {
+                seq: std::slice::from_raw_parts_mut(self.seq_data.add(seq_start), len)
+                    .as_bstr_mut(),
+                qual: std::slice::from_raw_parts_mut(self.qual_data.add(qual_start), len)
+                    .as_bstr_mut(),
+            }
+        })
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = self.back - self.front;
+        (r, Some(r))
+    }
+}
+
+impl DoubleEndedIterator for DualIterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        self.back -= 1;
+        let r = self.storage.entry_range(self.back);
+        let seq_start = r.start + self.seq_first_byte;
+        let qual_start = r.start + self.qual_first_byte;
+        let len = r.end - r.start;
+        Some(unsafe {
+            DualEntryMut {
+                seq: std::slice::from_raw_parts_mut(self.seq_data.add(seq_start), len)
+                    .as_bstr_mut(),
+                qual: std::slice::from_raw_parts_mut(self.qual_data.add(qual_start), len)
+                    .as_bstr_mut(),
+            }
+        })
+    }
+}
+
+impl ExactSizeIterator for DualIterMut<'_> {}
 
 // ── owning builder ───────────────────────────────────────────────────────
 
@@ -492,34 +734,57 @@ impl DualStringPodBuilder {
 // ── alias builder ────────────────────────────────────────────────────────
 
 /// Builds a [`DualStringPod`] whose entries reference bytes in an existing
-/// pod's `seq` and `qual` `Arc<[u8]>` buffers without copying. Both buffers
-/// are pinned for the alias pod's lifetime (snapshot semantics).
-pub struct DualStringPodAliasBuilder {
-    seq: Arc<Vec<u8>>,
-    qual: Arc<Vec<u8>>,
+/// pod's `seq` and `qual` `Arc<[u8]>` buffers without copying.
+///
+/// Each [`push_alias`](DualStringPodAliasBuilder::push_alias) call consumes
+/// the *next* source entry in order, so aliases are guaranteed to be
+/// non-overlapping. At most `source.len()` aliases may be pushed.
+///
+/// The source pod is borrowed for the builder's lifetime and released on
+/// [`finish`](DualStringPodAliasBuilder::finish). Both buffers are then
+/// co-owned by the alias pod (snapshot semantics).
+pub struct DualStringPodAliasBuilder<'a> {
+    source: &'a DualStringPod,
+    next: usize,
     positions: Vec<(u32, u32)>,
 }
 
-impl DualStringPodAliasBuilder {
-    /// Record an alias entry covering bytes `[start..start+len]` in both
-    /// the source pod's seq and qual buffers.
+impl<'a> DualStringPodAliasBuilder<'a> {
+    /// Alias the next source entry, taking `source_entry[offset..offset+len]`
+    /// in both the seq and qual buffers.
+    ///
+    /// `offset` and `len` are relative to the visible start of the source
+    /// entry (after any `cut_start` / `cut_end` overlays).
     ///
     /// # Panics
-    /// If the range is out of bounds or values exceed `u32`.
-    pub fn push_alias(&mut self, start: usize, len: usize) {
-        let start_u32 = u32::try_from(start).expect("alias start exceeds u32");
-        let len_u32 = u32::try_from(len).expect("alias len exceeds u32");
-        let stop_u32 = start_u32
-            .checked_add(len_u32)
-            .expect("alias start + len exceeds u32");
+    /// - If all source entries have already been consumed.
+    /// - If `offset + len > source.entry_len(next)`.
+    /// - If any computed byte position would exceed `u32::MAX`.
+    pub fn push_alias(&mut self, offset: usize, len: usize) {
         assert!(
-            (stop_u32 as usize) <= self.seq.len(),
-            "alias range {}..{} out of source bounds (seq len {})",
-            start,
-            start + len,
-            self.seq.len()
+            self.next < self.source.len(),
+            "alias builder: all {} source entries already consumed",
+            self.source.len(),
         );
-        self.positions.push((start_u32, stop_u32));
+        let r = self.source.storage.entry_range(self.next);
+        let entry_len = r.end - r.start;
+        let end = offset
+            .checked_add(len)
+            .expect("alias offset + len overflows usize");
+        assert!(
+            end <= entry_len,
+            "alias offset {offset}+len {len}={end} exceeds entry length {entry_len}",
+        );
+        // Absolute position in both buffers (seq_first_byte == qual_first_byte
+        // for pods built via DualStringPodBuilder, which is the expected source).
+        let abs_start =
+            u32::try_from(r.start + self.source.seq_first_byte + offset)
+                .expect("alias start exceeds u32");
+        let abs_end =
+            u32::try_from(r.start + self.source.seq_first_byte + end)
+                .expect("alias end exceeds u32");
+        self.positions.push((abs_start, abs_end));
+        self.next += 1;
     }
 
     #[must_use]
@@ -532,11 +797,12 @@ impl DualStringPodAliasBuilder {
         self.positions.is_empty()
     }
 
+    /// Finalise the alias builder, releasing the borrow of the source pod.
     #[must_use]
     pub fn finish(self) -> DualStringPod {
         DualStringPod {
-            seq: self.seq,
-            qual: self.qual,
+            seq: Arc::clone(&self.source.seq),
+            qual: Arc::clone(&self.source.qual),
             storage: Storage::Variable {
                 positions: self.positions,
                 head_skip: 0,
@@ -663,12 +929,12 @@ mod tests {
         bld.push(b("AB"), b("12"));
         bld.push(b("CD"), b("34"));
         let p = bld.finish();
-        let pairs: Vec<(&BStr, &BStr)> = p.iter().collect();
+        let pairs: Vec<_> = p.iter().collect();
         assert_eq!(pairs.len(), 2);
-        assert_eq!(pairs[0].0, BStr::new("AB"));
-        assert_eq!(pairs[0].1, BStr::new("12"));
-        assert_eq!(pairs[1].0, BStr::new("CD"));
-        assert_eq!(pairs[1].1, BStr::new("34"));
+        assert_eq!(pairs[0].seq, BStr::new("AB"));
+        assert_eq!(pairs[0].qual, BStr::new("12"));
+        assert_eq!(pairs[1].seq, BStr::new("CD"));
+        assert_eq!(pairs[1].qual, BStr::new("34"));
     }
 
     #[test]
@@ -695,18 +961,19 @@ mod tests {
 
     #[test]
     fn alias_builder_basic() {
-        let mut bld = DualStringPodBuilder::with_capacity(0, 1);
-        bld.push(b("HELLOWORLD"), b("FFFFFFFFFF"));
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("HELLOWORLD"), b("0123456789"));
+        bld.push(b("ACGTACGT"),   b("IIIIIIII"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
-        ab.push_alias(0, 5); // "HELLO" / "FFFFF"
-        ab.push_alias(5, 5); // "WORLD" / "FFFFF"
+        ab.push_alias(0, 5); // entry 0, offset 0, len 5 → "HELLO" / "01234"
+        ab.push_alias(2, 4); // entry 1, offset 2, len 4 → "GTAC" / "IIII"
         let aliased = ab.finish();
         assert_eq!(aliased.len(), 2);
         assert_eq!(aliased.seq(0), BStr::new("HELLO"));
-        assert_eq!(aliased.qual(0), BStr::new("FFFFF"));
-        assert_eq!(aliased.seq(1), BStr::new("WORLD"));
-        assert_eq!(aliased.qual(1), BStr::new("FFFFF"));
+        assert_eq!(aliased.qual(0), BStr::new("01234"));
+        assert_eq!(aliased.seq(1), BStr::new("GTAC"));
+        assert_eq!(aliased.qual(1), BStr::new("IIII"));
     }
 
     #[test]
@@ -716,13 +983,18 @@ mod tests {
         bld.push(b("BBBB"), b("2222"));
         bld.push(b("CCCC"), b("3333"));
         let mut source = bld.finish();
-        let mut ab = source.alias_builder();
-        ab.push_alias(4, 4); // points at "BBBB" / "2222"
-        let aliased = ab.finish();
+        let aliased = {
+            let mut ab = source.alias_builder();
+            ab.push_alias(0, 4); // entry 0 ("AAAA" / "1111"), full range
+            ab.push_alias(0, 4); // entry 1 ("BBBB" / "2222"), full range
+            ab.finish()
+        };
         source.drain(1..2);
         assert_eq!(source.len(), 2);
-        assert_eq!(aliased.seq(0), BStr::new("BBBB"));
-        assert_eq!(aliased.qual(0), BStr::new("2222"));
+        assert_eq!(aliased.seq(0), BStr::new("AAAA"));
+        assert_eq!(aliased.qual(0), BStr::new("1111"));
+        assert_eq!(aliased.seq(1), BStr::new("BBBB"));
+        assert_eq!(aliased.qual(1), BStr::new("2222"));
     }
 
     #[test]
@@ -732,22 +1004,73 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(0, 1);
         bld.push(b("ACGTACGT"), b("!\"#$%&'("));
         let source = bld.finish();
-        let mut ab = source.alias_builder();
-        ab.push_alias(2, 4);
-        let aliased = ab.finish();
+        let aliased = {
+            let mut ab = source.alias_builder();
+            ab.push_alias(2, 4); // entry 0, offset 2, len 4 → "GTAC" / "#$%&"
+            ab.finish()
+        };
         drop(source);
         assert_eq!(aliased.seq(0), BStr::new("GTAC"));
         assert_eq!(aliased.qual(0), BStr::new("#$%&"));
     }
 
     #[test]
-    #[should_panic(expected = "out of source bounds")]
+    #[should_panic(expected = "exceeds entry")]
     fn alias_out_of_bounds_panics() {
         let mut bld = DualStringPodBuilder::with_capacity(0, 1);
         bld.push(b("hello"), b("xxxxx"));
         let source = bld.finish();
         let mut ab = source.alias_builder();
-        ab.push_alias(3, 10);
+        ab.push_alias(3, 10); // offset 3 + len 10 = 13 > entry len 5
+    }
+
+    #[test]
+    #[should_panic(expected = "already consumed")]
+    fn alias_too_many_entries_panics() {
+        let mut bld = DualStringPodBuilder::with_capacity(4, 1);
+        bld.push(b("AAAA"), b("1111"));
+        let source = bld.finish();
+        let mut ab = source.alias_builder();
+        ab.push_alias(0, 4);
+        ab.push_alias(0, 4); // second push on a 1-entry source — panics
+    }
+
+    #[test]
+    fn seq_mut_exclusive_succeeds() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"), b("###"));
+        let mut p = bld.finish();
+        p.seq_mut(0).unwrap().copy_from_slice(b("ZZZ"));
+        assert_eq!(p.seq(0), BStr::new("ZZZ"));
+        assert_eq!(p.qual(0), BStr::new("###"));
+    }
+
+    #[test]
+    fn qual_mut_exclusive_succeeds() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"), b("###"));
+        let mut p = bld.finish();
+        p.qual_mut(0).unwrap().copy_from_slice(b("@@@"));
+        assert_eq!(p.seq(0), BStr::new("AAA"));
+        assert_eq!(p.qual(0), BStr::new("@@@"));
+    }
+
+    #[test]
+    fn seq_mut_shared_returns_none() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"), b("###"));
+        let mut p = bld.finish();
+        let _q = p.clone();
+        assert!(p.seq_mut(0).is_none());
+    }
+
+    #[test]
+    fn qual_mut_shared_returns_none() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 1);
+        bld.push(b("AAA"), b("###"));
+        let mut p = bld.finish();
+        let _q = p.clone();
+        assert!(p.qual_mut(0).is_none());
     }
 
     #[test]
@@ -755,7 +1078,7 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DualStringPod>();
         assert_send_sync::<super::DualStringPodBuilder>();
-        assert_send_sync::<super::DualStringPodAliasBuilder>();
+        assert_send_sync::<super::DualStringPodAliasBuilder<'static>>();
     }
 
     #[test]
@@ -849,9 +1172,9 @@ mod tests {
         let seq = seq_pod(&["A", "ACGTACGT", "ACG"]);
         let qual = seq_pod(&["I", "FFFFFFFF", "JJJ"]);
         let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
-        let pairs: Vec<(&BStr, &BStr)> = dual.iter().collect();
-        assert_eq!(pairs[1].0, BStr::new("ACGTACGT"));
-        assert_eq!(pairs[1].1, BStr::new("FFFFFFFF"));
+        let pairs: Vec<_> = dual.iter().collect();
+        assert_eq!(pairs[1].seq, BStr::new("ACGTACGT"));
+        assert_eq!(pairs[1].qual, BStr::new("FFFFFFFF"));
     }
 
     #[test]
@@ -869,6 +1192,133 @@ mod tests {
         let qual = seq_pod(&["IIII"]);
         let err = DualStringPod::try_from_columns(seq, qual).unwrap_err();
         assert_eq!(err, ColumnError::EqualCountViolated);
+    }
+
+    // ── prefix / postfix ──────────────────────────────────────────────────
+
+    #[test]
+    fn dual_prefix_prepends_both_columns() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"), b("###"));
+        bld.push(b("BBB"), b("$$$"));
+        let p = bld.finish().prefix(b("XX"), b("!!"));
+        assert!(p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("XXAAA"));
+        assert_eq!(p.qual(0), BStr::new("!!###"));
+        assert_eq!(p.seq(1), BStr::new("XXBBB"));
+        assert_eq!(p.qual(1), BStr::new("!!$$$"));
+    }
+
+    #[test]
+    fn dual_postfix_appends_both_columns() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"), b("###"));
+        bld.push(b("BBB"), b("$$$"));
+        let p = bld.finish().postfix(b("ZZ"), b("++"));
+        assert!(p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("AAAZZ"));
+        assert_eq!(p.qual(0), BStr::new("###++"));
+    }
+
+    #[test]
+    #[should_panic(expected = "seq_text.len()")]
+    fn dual_prefix_length_mismatch_panics() {
+        let p = DualStringPod::empty();
+        let _ = p.prefix(b("AB"), b("X"));
+    }
+
+    // ── max_len ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn dual_max_len_fixed_clips() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 2);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        let p = bld.finish().max_len(3);
+        assert!(p.is_fixed_length());
+        assert_eq!(p.seq(0), BStr::new("HEL"));
+        assert_eq!(p.qual(0), BStr::new("123"));
+    }
+
+    #[test]
+    fn dual_max_len_variable_clips_each() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
+        bld.push(b("AC"), b("II"));
+        let p = bld.finish().max_len(4);
+        assert_eq!(p.seq(0), BStr::new("ACGT"));
+        assert_eq!(p.qual(0), BStr::new("IIII"));
+        assert_eq!(p.seq(1), BStr::new("AC"));
+        assert_eq!(p.qual(1), BStr::new("II"));
+    }
+
+    // ── reverse ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn dual_reverse_both_columns() {
+        let mut bld = DualStringPodBuilder::with_capacity(4, 2);
+        bld.push(b("ACGT"), b("IIII"));
+        bld.push(b("TTTT"), b("####"));
+        let p = bld.finish().reverse();
+        assert_eq!(p.seq(0), BStr::new("TGCA"));
+        assert_eq!(p.qual(0), BStr::new("IIII"));
+        assert_eq!(p.seq(1), BStr::new("TTTT"));
+        assert_eq!(p.qual(1), BStr::new("####"));
+    }
+
+    #[test]
+    fn dual_reverse_cow_clones_shared_arc() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 1);
+        bld.push(b("ACG"), b("III"));
+        let p = bld.finish();
+        let q = p.clone();
+        let r = p.reverse();
+        assert_eq!(q.seq(0), BStr::new("ACG"));
+        assert_eq!(r.seq(0), BStr::new("GCA"));
+    }
+
+    // ── iter_mut ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn dual_iter_mut_allows_in_place_mutation() {
+        let mut bld = DualStringPodBuilder::with_capacity(4, 2);
+        bld.push(b("ACGT"), b("IIII"));
+        bld.push(b("TTTT"), b("####"));
+        let mut p = bld.finish();
+        for entry in p.iter_mut().unwrap() {
+            entry.seq.reverse();
+            entry.qual.reverse();
+        }
+        assert_eq!(p.seq(0), BStr::new("TGCA"));
+        assert_eq!(p.qual(0), BStr::new("IIII")); // palindrome
+        assert_eq!(p.seq(1), BStr::new("TTTT")); // palindrome
+        assert_eq!(p.qual(1), BStr::new("####")); // palindrome
+    }
+
+    #[test]
+    fn dual_iter_mut_returns_none_when_shared() {
+        let mut bld = DualStringPodBuilder::with_capacity(2, 1);
+        bld.push(b("AB"), b("12"));
+        let mut p = bld.finish();
+        let _q = p.clone();
+        assert!(p.iter_mut().is_none());
+    }
+
+    #[test]
+    fn dual_iter_mut_double_ended() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 3);
+        bld.push(b("ACG"), b("III"));
+        bld.push(b("TTT"), b("###"));
+        bld.push(b("GCA"), b("FFF"));
+        let mut p = bld.finish();
+        {
+            let mut it = p.iter_mut().unwrap();
+            it.next().unwrap().seq.reverse();       // ACG → GCA
+            it.next_back().unwrap().seq.reverse();  // GCA → ACG
+        }
+        assert_eq!(p.seq(0), BStr::new("GCA"));
+        assert_eq!(p.seq(1), BStr::new("TTT")); // untouched
+        assert_eq!(p.seq(2), BStr::new("ACG"));
     }
 
     #[test]

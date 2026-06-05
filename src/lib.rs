@@ -26,5 +26,8 @@ mod dual;
 mod single;
 mod storage;
 
-pub use dual::{ColumnError, DualStringPod, DualStringPodAliasBuilder, DualStringPodBuilder};
-pub use single::{StringPod, StringPodAliasBuilder, StringPodBuilder};
+pub use dual::{
+    ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,
+    DualStringPodBuilder,
+};
+pub use single::{IterMut as StringPodIterMut, StringPod, StringPodAliasBuilder, StringPodBuilder};
