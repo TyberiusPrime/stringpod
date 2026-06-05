@@ -1,5 +1,4 @@
 use bstr::{BStr, ByteSlice as _};
-use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -437,17 +436,26 @@ impl DualStringPod {
     /// Returns a mutable iterator over seq+qual entry pairs, or `None` if
     /// either byte buffer is shared (Arc strong count > 1).
     pub fn iter_mut(&mut self) -> Option<DualIterMut<'_>> {
-        let seq_ptr = Arc::get_mut(&mut self.seq)?.as_mut_ptr();
-        let qual_ptr = Arc::get_mut(&mut self.qual)?.as_mut_ptr();
+        let back = self.storage.len();
+        let seq_first_byte = self.seq_first_byte;
+        let qual_first_byte = self.qual_first_byte;
+        // Three disjoint fields: seq + qual mutably, storage immutably. Skip
+        // each buffer's first-byte prefix so both `remaining` slices start at
+        // the same *relative* offset (storage's coordinate system), letting one
+        // shared `consumed` drive both peels.
+        let (_, seq_remaining) = Arc::get_mut(&mut self.seq)?
+            .as_mut_slice()
+            .split_at_mut(seq_first_byte);
+        let (_, qual_remaining) = Arc::get_mut(&mut self.qual)?
+            .as_mut_slice()
+            .split_at_mut(qual_first_byte);
         Some(DualIterMut {
-            seq_data: seq_ptr,
-            qual_data: qual_ptr,
+            seq_remaining,
+            qual_remaining,
             storage: &self.storage,
-            seq_first_byte: self.seq_first_byte,
-            qual_first_byte: self.qual_first_byte,
             front: 0,
-            back: self.storage.len(),
-            _marker: PhantomData,
+            back,
+            consumed: 0,
         })
     }
 
@@ -581,21 +589,20 @@ pub struct DualEntryMut<'a> {
     pub qual: &'a mut BStr,
 }
 
+/// Mutable seq+qual entry iterator. Like [`single::IterMut`](crate::StringPodIterMut)
+/// it peels entries off held buffer slices with [`split_at_mut`](slice::split_at_mut)
+/// — no `unsafe`. Both buffers share one storage layout (offset by their
+/// first-byte), so one relative `consumed` cursor drives both. Relies on the
+/// ascending, non-overlapping entry order every builder path upholds.
 pub struct DualIterMut<'a> {
-    seq_data: *mut u8,
-    qual_data: *mut u8,
+    seq_remaining: &'a mut [u8],
+    qual_remaining: &'a mut [u8],
     storage: &'a Storage,
-    seq_first_byte: usize,
-    qual_first_byte: usize,
     front: usize,
     back: usize,
-    _marker: PhantomData<&'a mut u8>,
+    /// Relative offset (storage coordinates) of both `remaining` slices' starts.
+    consumed: usize,
 }
-
-// Safety: `DualIterMut` holds exclusive access (via `Arc::get_mut`) to both
-// underlying buffers, mirroring `slice::IterMut`.
-unsafe impl Send for DualIterMut<'_> {}
-unsafe impl Sync for DualIterMut<'_> {}
 
 impl<'a> Iterator for DualIterMut<'a> {
     type Item = DualEntryMut<'a>;
@@ -605,19 +612,26 @@ impl<'a> Iterator for DualIterMut<'a> {
         }
         let r = self.storage.entry_range(self.front);
         self.front += 1;
-        let seq_start = r.start + self.seq_first_byte;
-        let qual_start = r.start + self.qual_first_byte;
+        debug_assert!(
+            r.start >= self.consumed,
+            "DualIterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let gap = r.start - self.consumed;
         let len = r.end - r.start;
-        // Safety: each entry range is visited at most once (front is
-        // monotone increasing). Both `seq_data` and `qual_data` were
-        // obtained via `Arc::get_mut`, guaranteeing exclusive buffer access.
-        Some(unsafe {
-            DualEntryMut {
-                seq: std::slice::from_raw_parts_mut(self.seq_data.add(seq_start), len)
-                    .as_bstr_mut(),
-                qual: std::slice::from_raw_parts_mut(self.qual_data.add(qual_start), len)
-                    .as_bstr_mut(),
-            }
+        let seq_rem = std::mem::take(&mut self.seq_remaining);
+        let qual_rem = std::mem::take(&mut self.qual_remaining);
+        let (_seq_gap, seq_rest) = seq_rem.split_at_mut(gap);
+        let (seq, seq_tail) = seq_rest.split_at_mut(len);
+        let (_qual_gap, qual_rest) = qual_rem.split_at_mut(gap);
+        let (qual, qual_tail) = qual_rest.split_at_mut(len);
+        self.seq_remaining = seq_tail;
+        self.qual_remaining = qual_tail;
+        self.consumed = r.end;
+        Some(DualEntryMut {
+            seq: seq.as_bstr_mut(),
+            qual: qual.as_bstr_mut(),
         })
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -633,16 +647,25 @@ impl DoubleEndedIterator for DualIterMut<'_> {
         }
         self.back -= 1;
         let r = self.storage.entry_range(self.back);
-        let seq_start = r.start + self.seq_first_byte;
-        let qual_start = r.start + self.qual_first_byte;
+        debug_assert!(
+            r.start >= self.consumed,
+            "DualIterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let split = r.start - self.consumed;
         let len = r.end - r.start;
-        Some(unsafe {
-            DualEntryMut {
-                seq: std::slice::from_raw_parts_mut(self.seq_data.add(seq_start), len)
-                    .as_bstr_mut(),
-                qual: std::slice::from_raw_parts_mut(self.qual_data.add(qual_start), len)
-                    .as_bstr_mut(),
-            }
+        let seq_rem = std::mem::take(&mut self.seq_remaining);
+        let qual_rem = std::mem::take(&mut self.qual_remaining);
+        let (seq_left, seq_right) = seq_rem.split_at_mut(split);
+        let (seq, _seq_after) = seq_right.split_at_mut(len);
+        let (qual_left, qual_right) = qual_rem.split_at_mut(split);
+        let (qual, _qual_after) = qual_right.split_at_mut(len);
+        self.seq_remaining = seq_left;
+        self.qual_remaining = qual_left;
+        Some(DualEntryMut {
+            seq: seq.as_bstr_mut(),
+            qual: qual.as_bstr_mut(),
         })
     }
 }
@@ -1319,6 +1342,76 @@ mod tests {
         assert_eq!(p.seq(0), BStr::new("GCA"));
         assert_eq!(p.seq(1), BStr::new("TTT")); // untouched
         assert_eq!(p.seq(2), BStr::new("ACG"));
+    }
+
+    #[test]
+    fn dual_iter_mut_skips_cut_gaps() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 2);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        let mut p = bld.finish();
+        p.cut_start(1);
+        p.cut_end(1); // visible seq: "ELL","ORL"; qual: "234","789"
+        for e in p.iter_mut().unwrap() {
+            e.seq.reverse();
+            e.qual.reverse();
+        }
+        assert_eq!(p.seq(0), BStr::new("LLE"));
+        assert_eq!(p.qual(0), BStr::new("432"));
+        assert_eq!(p.seq(1), BStr::new("LRO"));
+        assert_eq!(p.qual(1), BStr::new("987"));
+    }
+
+    #[test]
+    fn dual_iter_mut_variable_lengths() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+        bld.push(b("ACGTACGT"), b("IIIIIIII"));
+        bld.push(b("AC"), b("JJ"));
+        let mut p = bld.finish();
+        for e in p.iter_mut().unwrap() {
+            e.seq.make_ascii_lowercase();
+        }
+        assert_eq!(p.seq(0), BStr::new("acgtacgt"));
+        assert_eq!(p.qual(0), BStr::new("IIIIIIII")); // untouched
+        assert_eq!(p.seq(1), BStr::new("ac"));
+    }
+
+    #[test]
+    fn dual_iter_mut_divergent_first_bytes() {
+        // The key case: seq carries a stray leading entry (popped), so
+        // seq_first_byte (4) != qual_first_byte (0). Both buffers must still be
+        // peeled correctly off one shared relative cursor.
+        let mut seq = fixed_pod(4, &["XXXX", "ACGT", "TTTT"]);
+        seq.pop_front(1); // seq_first_byte becomes 4
+        let qual = fixed_pod(4, &["IIII", "FFFF"]); // qual_first_byte 0
+        let mut dual = DualStringPod::try_from_columns(seq, qual).unwrap();
+        // Sources were moved in, so both Arcs are uniquely owned here.
+        for e in dual.iter_mut().unwrap() {
+            e.seq.make_ascii_lowercase();
+            e.qual.make_ascii_lowercase();
+        }
+        assert_eq!(dual.seq(0), BStr::new("acgt"));
+        assert_eq!(dual.qual(0), BStr::new("iiii"));
+        assert_eq!(dual.seq(1), BStr::new("tttt"));
+        assert_eq!(dual.qual(1), BStr::new("ffff"));
+    }
+
+    #[test]
+    fn dual_iter_mut_collect_all_then_mutate() {
+        let mut bld = DualStringPodBuilder::with_capacity(2, 3);
+        bld.push(b("AA"), b("11"));
+        bld.push(b("BB"), b("22"));
+        bld.push(b("CC"), b("33"));
+        let mut p = bld.finish();
+        {
+            let all: Vec<_> = p.iter_mut().unwrap().collect();
+            assert_eq!(all.len(), 3);
+            for e in all {
+                e.seq.make_ascii_lowercase();
+            }
+        }
+        assert_eq!(p.seq(0), BStr::new("aa"));
+        assert_eq!(p.seq(2), BStr::new("cc"));
     }
 
     #[test]

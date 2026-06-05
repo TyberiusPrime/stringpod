@@ -1,5 +1,4 @@
 use bstr::{BStr, ByteSlice as _};
-use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -243,13 +242,16 @@ impl StringPod {
     /// Returns a mutable iterator over entries, or `None` if the byte buffer
     /// is shared (Arc strong count > 1).
     pub fn iter_mut(&mut self) -> Option<IterMut<'_>> {
-        let ptr = Arc::get_mut(&mut self.data)?.as_mut_ptr();
+        let back = self.storage.len();
+        // Disjoint fields: `data` borrowed mutably for the iterator, `storage`
+        // immutably to drive the entry ranges.
+        let buffer = Arc::get_mut(&mut self.data)?.as_mut_slice();
         Some(IterMut {
-            data: ptr,
+            remaining: buffer,
             storage: &self.storage,
             front: 0,
-            back: self.storage.len(),
-            _marker: PhantomData,
+            back,
+            consumed: 0,
         })
     }
 
@@ -334,18 +336,22 @@ impl DoubleEndedIterator for Iter<'_> {
 
 impl ExactSizeIterator for Iter<'_> {}
 
+/// Mutable entry iterator. Holds the not-yet-yielded slice of the buffer and
+/// peels each entry off with [`split_at_mut`](slice::split_at_mut) — no
+/// `unsafe`, the same way `std`'s own `slice::IterMut` is shaped. This relies on
+/// entries being ascending and non-overlapping in the buffer, which every
+/// builder path upholds (the owning builder appends; the alias builder
+/// sub-slices entries consumed in order).
 pub struct IterMut<'a> {
-    data: *mut u8,
+    /// `buffer[consumed .. back_boundary]`: the bytes spanning live entries
+    /// `front..back` plus the gaps (cuts, dropped fronts) between them.
+    remaining: &'a mut [u8],
     storage: &'a Storage,
     front: usize,
     back: usize,
-    _marker: PhantomData<&'a mut u8>,
+    /// Absolute buffer offset of `remaining[0]`; advances as the front is peeled.
+    consumed: usize,
 }
-
-// Safety: `IterMut` holds exclusive access (via `Arc::get_mut`) to the
-// underlying buffer, mirroring `slice::IterMut`.
-unsafe impl Send for IterMut<'_> {}
-unsafe impl Sync for IterMut<'_> {}
 
 impl<'a> Iterator for IterMut<'a> {
     type Item = &'a mut BStr;
@@ -355,14 +361,22 @@ impl<'a> Iterator for IterMut<'a> {
         }
         let r = self.storage.entry_range(self.front);
         self.front += 1;
-        // Safety: each entry range is visited at most once (front is
-        // monotone increasing). `data` was obtained via `Arc::get_mut`,
-        // guaranteeing exclusive buffer access. Builder-built entries are
-        // non-overlapping by construction.
-        Some(unsafe {
-            std::slice::from_raw_parts_mut(self.data.add(r.start), r.end - r.start)
-                .as_bstr_mut()
-        })
+        // The visible range sits at `r.start - consumed` into `remaining`: peel
+        // the leading gap, then the entry, and keep the tail. `mem::take` hands
+        // out the entry with the iterator's `'a`, not a borrow of `self`, so the
+        // items outlive the iterator (collectable, like `slice::iter_mut`).
+        debug_assert!(
+            r.start >= self.consumed,
+            "IterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let rem = std::mem::take(&mut self.remaining);
+        let (_gap, rest) = rem.split_at_mut(r.start - self.consumed);
+        let (entry, tail) = rest.split_at_mut(r.end - r.start);
+        self.remaining = tail;
+        self.consumed = r.end;
+        Some(entry.as_bstr_mut())
     }
     fn size_hint(&self) -> (usize, Option<usize>) {
         let r = self.back - self.front;
@@ -377,10 +391,19 @@ impl DoubleEndedIterator for IterMut<'_> {
         }
         self.back -= 1;
         let r = self.storage.entry_range(self.back);
-        Some(unsafe {
-            std::slice::from_raw_parts_mut(self.data.add(r.start), r.end - r.start)
-                .as_bstr_mut()
-        })
+        // The back entry is the highest-offset live entry: keep everything
+        // before it (`left`), hand out the entry, drop the trailing gap.
+        debug_assert!(
+            r.start >= self.consumed,
+            "IterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let rem = std::mem::take(&mut self.remaining);
+        let (left, right) = rem.split_at_mut(r.start - self.consumed);
+        let (entry, _after) = right.split_at_mut(r.end - r.start);
+        self.remaining = left;
+        Some(entry.as_bstr_mut())
     }
 }
 
@@ -1149,6 +1172,99 @@ mod tests {
         assert_eq!(p.get(0), BStr::new("CBA"));
         assert_eq!(p.get(1), BStr::new("DEF"));
         assert_eq!(p.get(2), BStr::new("IHG"));
+    }
+
+    #[test]
+    fn iter_mut_variable_lengths() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("hello"));
+        bld.push(b("hi"));
+        bld.push(b("foobar"));
+        let mut p = bld.finish();
+        for entry in p.iter_mut().unwrap() {
+            entry.make_ascii_uppercase();
+        }
+        assert_eq!(p.get(0), BStr::new("HELLO"));
+        assert_eq!(p.get(1), BStr::new("HI"));
+        assert_eq!(p.get(2), BStr::new("FOOBAR"));
+    }
+
+    #[test]
+    fn iter_mut_skips_cut_gaps() {
+        // cut_start / cut_end leave head/tail gaps the peel must step over.
+        let mut bld = StringPodBuilder::with_capacity(6, 3);
+        bld.push(b("ABCDEF"));
+        bld.push(b("UVWXYZ"));
+        bld.push(b("012345"));
+        let mut p = bld.finish();
+        p.cut_start(1);
+        p.cut_end(1); // visible: "BCDE", "VWXY", "1234"
+        for entry in p.iter_mut().unwrap() {
+            entry.reverse();
+        }
+        assert_eq!(p.get(0), BStr::new("EDCB"));
+        assert_eq!(p.get(1), BStr::new("YXWV"));
+        assert_eq!(p.get(2), BStr::new("4321"));
+    }
+
+    #[test]
+    fn iter_mut_alias_pod_noncontiguous() {
+        // Alias entries are non-contiguous sub-ranges with gaps between them.
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("FOOBAR"));
+        let source = bld.finish();
+        let mut aliased = {
+            let mut ab = source.alias_builder();
+            ab.push_alias(1, 3); // "ELL"
+            ab.push_alias(0, 5); // "WORLD"
+            ab.push_alias(2, 3); // "OBA"
+            ab.finish()
+        };
+        drop(source); // make the shared buffer uniquely owned
+        for entry in aliased.iter_mut().unwrap() {
+            entry.make_ascii_lowercase();
+        }
+        assert_eq!(aliased.get(0), BStr::new("ell"));
+        assert_eq!(aliased.get(1), BStr::new("world"));
+        assert_eq!(aliased.get(2), BStr::new("oba"));
+    }
+
+    #[test]
+    fn iter_mut_double_ended_variable() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("alpha"));
+        bld.push(b("be"));
+        bld.push(b("gamma"));
+        let mut p = bld.finish();
+        {
+            let mut it = p.iter_mut().unwrap();
+            it.next().unwrap().make_ascii_uppercase(); // alpha → ALPHA
+            it.next_back().unwrap().make_ascii_uppercase(); // gamma → GAMMA
+        }
+        assert_eq!(p.get(0), BStr::new("ALPHA"));
+        assert_eq!(p.get(1), BStr::new("be")); // untouched
+        assert_eq!(p.get(2), BStr::new("GAMMA"));
+    }
+
+    #[test]
+    fn iter_mut_collect_all_then_mutate() {
+        // The items outlive the iterator (no borrow of it), so they collect.
+        let mut bld = StringPodBuilder::with_capacity(2, 3);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        bld.push(b("CC"));
+        let mut p = bld.finish();
+        {
+            let all: Vec<&mut BStr> = p.iter_mut().unwrap().collect();
+            assert_eq!(all.len(), 3);
+            for entry in all {
+                entry.make_ascii_lowercase();
+            }
+        }
+        assert_eq!(p.get(0), BStr::new("aa"));
+        assert_eq!(p.get(2), BStr::new("cc"));
     }
 
     #[test]

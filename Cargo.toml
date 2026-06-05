@@ -13,7 +13,7 @@ smallvec = "1.15.1"
 
 
 
-[workspace.lints.clippy]
+[lints.clippy]
 # I want it that way when I write it that way
 if-not-else = "allow"
 # Don't Panic - prevent panics from unwraps and unsafe slicing or indexing
