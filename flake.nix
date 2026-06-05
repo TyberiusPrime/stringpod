@@ -50,7 +50,6 @@
         # exposed as `packages.test.*` via `nix build .#test.<name>`.
         cargoVendor = pkgs.rustPlatform.importCargoLock { lockFile = ./Cargo.lock; };
 
-
         # Build one check-only derivation: a fixed toolchain, the vendored
         # deps wired up offline by cargoSetupHook, and a single cargo command.
         mkCargoCheck =
@@ -101,7 +100,6 @@
           phase = "cargo build --workspace --offline";
         };
 
-
       in
       rec {
         # `nix flake check` runs the FULL local matrix:
@@ -118,6 +116,16 @@
           clippy = ciClippy;
           fmt = ciFmt;
           msrv = ciMsrv;
+        };
+
+        # Minimal shell for cargo-deny CI check — avoids pulling in 
+        # the rest of the full devShell.  Usage: nix develop .#deny
+        devShells.deny = pkgs.mkShell {
+          nativeBuildInputs = [
+            pkgs.cargo-deny
+            pkgs.git
+            rust
+          ];
         };
 
         # `nix develop`
