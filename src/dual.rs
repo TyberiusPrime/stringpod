@@ -183,22 +183,13 @@ impl DualStringPod {
         })
     }
 
-    #[must_use]
-    pub fn to_exclusive(mut self) -> Self {
-        // if we're not shared, return Self,
-        // otherwise it's time to clone
-        if let Some(_) = Arc::get_mut(&mut self.seq) {
-            if let Some(_) = Arc::get_mut(&mut self.qual) {
-                return self;
-            }
-        }
-        Self {
-            seq: Arc::new((*self.seq).clone()),
-            qual: Arc::new((*self.qual).clone()),
-            storage: self.storage,
-            seq_first_byte: self.seq_first_byte,
-            qual_first_byte: self.qual_first_byte,
-        }
+    /// Ensure this pod owns both byte buffers outright, cloning each (COW) only
+    /// if it is currently shared with another pod. After this call, mutating
+    /// accessors such as [`seq_mut`](Self::seq_mut) always succeed.
+    pub fn make_exclusive(&mut self) {
+        // `Arc::make_mut` clones a buffer iff its strong count is > 1.
+        let _ = Arc::make_mut(&mut self.seq);
+        let _ = Arc::make_mut(&mut self.qual);
     }
 
     #[must_use]
@@ -340,6 +331,7 @@ impl DualStringPod {
     }
 
     #[must_use]
+    /// Iterate over (seq, qual) tuples
     pub fn iter(&self) -> Iter<'_> {
         Iter {
             pod: self,
@@ -366,6 +358,11 @@ impl DualStringPod {
             front: 0,
             back: self.len(),
         }
+    }
+
+    #[must_use]
+    pub fn iter_seq_lens(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |i| self.storage.entry_len(i))
     }
 
     /// Prepend `seq_text` / `qual_text` to every entry in the respective
@@ -446,18 +443,16 @@ impl DualStringPod {
     /// If `conditional` is `Some`, only entries where the boolean is `true`
     /// are clipped; this promotes `FixedLength` → `Variable`.
     #[must_use]
-    pub fn max_len(mut self, n: usize, conditional: Option<&[bool]>) -> Self {
+    pub fn max_len(&mut self, n: usize, conditional: Option<&[bool]>) {
         if let Some(cond) = conditional {
             let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
             self.storage.truncate_bytes_conditional(n_u32, cond);
-            return self;
         }
         if let Storage::FixedLength { visible_len, .. } = self.storage {
             let vl = visible_len as usize;
             if vl > n {
                 self.cut_end(vl - n, None);
             }
-            return self;
         }
         let count = self.len();
         let mut bld = DualStringPodBuilder::with_capacity(n, count);
@@ -473,7 +468,10 @@ impl DualStringPod {
             qual_buf.extend_from_slice(&q[..len]);
             bld.push(&seq_buf, &qual_buf);
         }
-        bld.finish()
+        let temp = bld.finish();
+        self.seq = temp.seq;
+        self.qual = temp.qual;
+        self.storage = temp.storage;
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
@@ -780,6 +778,7 @@ impl ExactSizeIterator for DualIterMut<'_> {}
 
 // ── owning builder ───────────────────────────────────────────────────────
 
+#[derive(Clone)]
 pub struct DualStringPodBuilder {
     seq: Vec<u8>,
     qual: Vec<u8>,

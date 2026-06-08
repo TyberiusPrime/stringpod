@@ -30,17 +30,14 @@ impl StringPod {
             },
         }
     }
-    #[must_use]
-    pub fn to_exclusive(mut self) -> Self {
-        // if we're not shared, return Self,
-        // otherwise it's time to clone
-        if let Some(_) = Arc::get_mut(&mut self.data) {
-            return self;
-        }
-        Self {
-            data: Arc::new((*self.data).clone()),
-            storage: self.storage,
-        }
+
+    /// Ensure this pod owns its byte buffer outright, cloning it (COW) only if
+    /// it is currently shared with another pod. After this call, mutating
+    /// accessors such as [`get_mut`](Self::get_mut) always succeed.
+    pub fn make_exclusive(&mut self) {
+        // `Arc::make_mut` clones the buffer iff the strong count is > 1, then
+        // hands back a unique `&mut`. We only want the side effect.
+        let _ = Arc::make_mut(&mut self.data);
     }
 
     /// An empty pod with no entries and an empty buffer.
@@ -342,6 +339,12 @@ impl StringPod {
         }
     }
 
+    /// iterate across the lengths
+    #[must_use]
+    pub fn iter_lens(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..self.len()).map(move |i| self.entry_len(i))
+    }
+
     /// Start an alias builder that shares this pod's byte buffer. New entries
     /// pushed via the alias builder will reference bytes inside `self.data`
     /// without copying.
@@ -497,6 +500,14 @@ pub struct StringPodBuilder {
 }
 
 impl StringPodBuilder {
+    /// Create a builder, without preallocating anything.
+    /// You probably want to use with_capacity if you have an idea
+    /// of the target sizes
+    #[must_use]
+    pub fn new() -> Self {
+        Self::with_capacity(0, 0)
+    }
+
     /// Create a builder reserving `entry_len * count` bytes. If `entry_len > 0`,
     /// storage starts `FixedLength` with stride `entry_len`; otherwise starts
     /// `Variable`.
@@ -635,7 +646,7 @@ impl StringPodAliasBuilder<'_> {
     pub fn finish(self) -> StringPod {
         StringPod {
             data: Arc::clone(&self.source.data),
-            storage: Storage::Variable (VariableInfo {
+            storage: Storage::Variable(VariableInfo {
                 positions: self.positions,
                 head_skip: 0,
                 tail_skip: 0,
@@ -1412,7 +1423,13 @@ mod tests {
         bld.push(b("KLMNO"));
         let mut p = bld.finish();
         // Only narrow odd entries; return None otherwise.
-        p.resize(|i, e| if i % 2 == 1 { Some((1, e.len() - 1)) } else { None });
+        p.resize(|i, e| {
+            if i % 2 == 1 {
+                Some((1, e.len() - 1))
+            } else {
+                None
+            }
+        });
         assert_eq!(p.get(0), BStr::new("ABCDE")); // untouched
         assert_eq!(p.get(1), BStr::new("GHIJ"));
         assert_eq!(p.get(2), BStr::new("KLMNO")); // untouched

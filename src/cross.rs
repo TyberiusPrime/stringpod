@@ -188,27 +188,101 @@ pub trait CrossPods {
         }
     }
 
+    /// Ensure every pod owns its byte buffer(s) outright, cloning (COW) only the
+    /// ones currently shared with another pod. After this call, in-place
+    /// mutation through [`iter_mut`](Self::iter_mut) is guaranteed to succeed.
+    ///
+    /// The default implementation forwards to each pod's `make_exclusive`; a
+    /// type whose pods alias one another can override it.
+    fn make_exclusive(&mut self)
+    where
+        Self: Sized,
+    {
+        for pod in self.pods_mut() {
+            match pod {
+                PodMut::Single(pod) => pod.make_exclusive(),
+                PodMut::Dual(pod) => pod.make_exclusive(),
+            }
+        }
+    }
+
     /// The mutable counterpart of [`iter`](Self::iter): the natural row-zip as
     /// [`CompanionMut`](Self::CompanionMut)s, no intermediate index to keep
     /// alive. The returned iterator owns its `&mut BStr` parts (it borrows only
     /// the pods, not any index), so it is collectable just like
     /// [`CrossPodLocations::try_iter_mut`].
     ///
-    /// Returns `None` (mutating nothing) if any pod's backing buffer is shared
-    /// (`Arc` strong count > 1). Whole-entry parts in distinct entries are
-    /// disjoint by construction, so this never panics on overlap.
+    /// Infallible: it first calls [`make_exclusive`](Self::make_exclusive), so a
+    /// shared backing buffer is silently cloned (copy-on-write) rather than
+    /// blocking the mutation. Whole-entry parts in distinct entries are disjoint
+    /// by construction, so this never panics on overlap.
     ///
     /// # Panics
     /// If the columns do not all have the same entry count.
-    fn try_iter_mut(&mut self) -> Option<CrossPodsRecordsMut<'_, Self>>
+    fn iter_mut(&mut self) -> CrossPodsRecordsMut<'_, Self>
     where
         Self: Sized,
     {
+        self.make_exclusive();
         // The per_row index is consumed by the peeling step and dropped here;
-        // try_iter_mut's result borrows only the pods, not the index, so it
-        // outlives this local cleanly.
+        // iter_mut's result borrows only the pods, not the index, so it
+        // outlives this local cleanly. make_exclusive above guarantees every
+        // buffer is uniquely owned, so the resolution cannot fail on sharing.
         let locs = CrossPodLocations::per_row(self);
         locs.try_iter_mut(self)
+            .expect("buffers were made exclusive, so they are uniquely owned")
+    }
+
+    /// Get an individual [`Companion`](Self::Companion): the whole entry `idx`
+    /// of every column, assembled the same way [`iter`](Self::iter) does, with
+    /// no intermediate [`CrossPodLocations`].
+    ///
+    /// # Panics
+    /// If `idx` is out of bounds for any column, or if the columns do not all
+    /// have the same entry count.
+    fn get(&self, idx: usize) -> Self::Companion<'_>
+    where
+        Self: Sized,
+    {
+        let pods = self.pods();
+        let colmap = colmap_for(&pods);
+        let row_count = checked_row_count(&pods, &colmap);
+        assert!(
+            idx < row_count,
+            "record index {idx} out of bounds ({row_count} records)",
+        );
+        let mut parts: SmallVec<[&BStr; 4]> = SmallVec::with_capacity(colmap.len());
+        for column in 0..colmap.len() {
+            parts.push(whole_entry_bytes(&pods, &colmap, column, idx));
+        }
+        Self::to_companion(&parts)
+    }
+
+    /// Get an individual [`CompanionMut`](Self::CompanionMut): the whole entry
+    /// `idx` of every column, the mutable counterpart of [`get`](Self::get).
+    ///
+    /// Infallible: like [`iter_mut`](Self::iter_mut) it first calls
+    /// [`make_exclusive`](Self::make_exclusive), so a shared backing buffer is
+    /// silently cloned (copy-on-write) rather than blocking the mutation. The
+    /// parts come from distinct columns and so are disjoint by construction.
+    ///
+    /// # Panics
+    /// If `idx` is out of bounds for any column.
+    fn get_mut(&mut self, idx: usize) -> Self::CompanionMut<'_>
+    where
+        Self: Sized,
+    {
+        self.make_exclusive();
+        let views = column_views_mut(self.pods_mut())
+            .expect("buffers were made exclusive, so they are uniquely owned");
+        let mut parts: SmallVec<[&mut BStr; 4]> = SmallVec::with_capacity(views.len());
+        for view in views {
+            let range = view.storage.entry_range(idx);
+            let start = range.start + view.first_byte;
+            let stop = range.end + view.first_byte;
+            parts.push(view.buffer[start..stop].as_bstr_mut());
+        }
+        Self::to_companion_mut(parts)
     }
 }
 
@@ -519,7 +593,10 @@ impl CrossPodLocations {
     /// or from whole entries never trip this. Use
     /// [`for_each_mut`](Self::for_each_mut) when you do need overlapping windows.
     #[must_use]
-    pub fn try_iter_mut<'a, T: CrossPods>(&self, pods: &'a mut T) -> Option<CrossPodsRecordsMut<'a, T>> {
+    pub fn try_iter_mut<'a, T: CrossPods>(
+        &self,
+        pods: &'a mut T,
+    ) -> Option<CrossPodsRecordsMut<'a, T>> {
         let views = column_views_mut(pods.pods_mut())?;
 
         // For each column, gather the (start, len) of every part that lands in
@@ -598,8 +675,8 @@ impl CrossPodLocations {
     /// Returns `false` (mutating nothing) if any pod's backing buffer is shared
     /// (`Arc` strong count > 1). Parts are handed out strictly one at a time, so
     /// this stays sound even when two locations address overlapping bytes —
-    /// unlike [`iter_mut`](Self::iter_mut), which exposes a whole record's parts
-    /// simultaneously and therefore requires them to be disjoint.
+    /// unlike [`try_iter_mut`](Self::try_iter_mut), which exposes a whole
+    /// record's parts simultaneously and therefore requires them to be disjoint.
     pub fn for_each_mut<T, F>(&self, pods: &mut T, mut visit: F) -> bool
     where
         T: CrossPods,
@@ -704,7 +781,7 @@ impl<'a, T: CrossPods> Iterator for RowCompanions<'a, T> {
 impl<T: CrossPods> ExactSizeIterator for RowCompanions<'_, T> {}
 
 /// Iterator over [`CrossPodLocations`] records as mutable companions. Created
-/// by [`CrossPodLocations::iter_mut`].
+/// by [`CrossPodLocations::try_iter_mut`].
 ///
 /// The companions own their `&mut BStr` parts (they don't borrow the iterator),
 /// so the iterator is collectable — every part across the whole iteration is a
@@ -1050,10 +1127,61 @@ mod tests {
     }
 
     #[test]
-    fn trait_try_iter_mut_mutates_whole_records() {
+    fn trait_get_resolves_named_companion() {
+        let chunk = chunk();
+        assert_eq!(
+            chunk.get(1),
+            FastQRead {
+                name: BStr::new("read2"),
+                seq: BStr::new("TTGG"),
+                qual: BStr::new("FF##"),
+                plus: BStr::new("+"),
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn trait_get_out_of_bounds_panics() {
+        let chunk = chunk();
+        let _ = chunk.get(2);
+    }
+
+    #[test]
+    fn trait_get_mut_mutates_one_record() {
         let mut chunk = chunk();
         {
-            let mut it = chunk.try_iter_mut().unwrap();
+            let read = chunk.get_mut(0);
+            read.name.make_ascii_uppercase();
+            read.seq.reverse();
+        }
+        let after = CrossPodLocations::per_row(&chunk);
+        let read0 = after.get(&chunk, 0).unwrap();
+        assert_eq!(read0.name, BStr::new("READ1"));
+        assert_eq!(read0.seq, BStr::new("TGCA"));
+        // The other record is untouched.
+        let read1 = after.get(&chunk, 1).unwrap();
+        assert_eq!(read1.name, BStr::new("read2"));
+        assert_eq!(read1.seq, BStr::new("TTGG"));
+    }
+
+    #[test]
+    fn trait_get_mut_cows_when_shared() {
+        let mut chunk = chunk();
+        let shared = chunk.seq_qual.clone(); // bumps the seq/qual Arc strong count
+        {
+            chunk.get_mut(0).seq.make_ascii_lowercase();
+        }
+        assert_eq!(chunk.get(0).seq, BStr::new("acgt"));
+        // The clone we held onto was left exactly as it was.
+        assert_eq!(shared.seq(0), BStr::new("ACGT"));
+    }
+
+    #[test]
+    fn trait_iter_mut_mutates_whole_records() {
+        let mut chunk = chunk();
+        {
+            let mut it = chunk.iter_mut();
             assert_eq!(it.len(), 2);
             for read in &mut it {
                 read.name.make_ascii_uppercase();
@@ -1070,10 +1198,22 @@ mod tests {
     }
 
     #[test]
-    fn trait_try_iter_mut_returns_none_when_shared() {
+    fn trait_iter_mut_cows_when_shared() {
+        // A shared backing buffer no longer blocks mutation: iter_mut silently
+        // clones (copy-on-write), so the original shared snapshot is untouched
+        // while the mutated pod gets its own buffer.
         let mut chunk = chunk();
-        let _shared = chunk.seq_qual.clone();
-        assert!(chunk.try_iter_mut().is_none());
+        let shared = chunk.seq_qual.clone(); // bumps the seq/qual Arc strong count
+        {
+            for read in &mut chunk.iter_mut() {
+                read.seq.make_ascii_lowercase();
+            }
+        }
+        // The mutated chunk changed...
+        let after = CrossPodLocations::per_row(&chunk);
+        assert_eq!(after.get(&chunk, 0).unwrap().seq, BStr::new("acgt"));
+        // ...but the clone we held onto was left exactly as it was.
+        assert_eq!(shared.seq(0), BStr::new("ACGT"));
     }
 
     #[test]
