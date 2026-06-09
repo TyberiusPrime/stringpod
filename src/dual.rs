@@ -442,36 +442,36 @@ impl DualStringPod {
     ///
     /// If `conditional` is `Some`, only entries where the boolean is `true`
     /// are clipped; this promotes `FixedLength` → `Variable`.
-    #[must_use]
     pub fn max_len(&mut self, n: usize, conditional: Option<&[bool]>) {
         if let Some(cond) = conditional {
             let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
             self.storage.truncate_bytes_conditional(n_u32, cond);
-        }
-        if let Storage::FixedLength { visible_len, .. } = self.storage {
-            let vl = visible_len as usize;
-            if vl > n {
-                self.cut_end(vl - n, None);
+        } else {
+            if let Storage::FixedLength { visible_len, .. } = self.storage {
+                let vl = visible_len as usize;
+                if vl > n {
+                    self.cut_end(vl - n, None);
+                }
             }
+            let count = self.len();
+            let mut bld = DualStringPodBuilder::with_capacity(n, count);
+            let mut seq_buf = Vec::with_capacity(n);
+            let mut qual_buf = Vec::with_capacity(n);
+            for i in 0..count {
+                let s = self.seq(i);
+                let q = self.qual(i);
+                let len = s.len().min(n);
+                seq_buf.clear();
+                seq_buf.extend_from_slice(&s[..len]);
+                qual_buf.clear();
+                qual_buf.extend_from_slice(&q[..len]);
+                bld.push(&seq_buf, &qual_buf);
+            }
+            let temp = bld.finish();
+            self.seq = temp.seq;
+            self.qual = temp.qual;
+            self.storage = temp.storage;
         }
-        let count = self.len();
-        let mut bld = DualStringPodBuilder::with_capacity(n, count);
-        let mut seq_buf = Vec::with_capacity(n);
-        let mut qual_buf = Vec::with_capacity(n);
-        for i in 0..count {
-            let s = self.seq(i);
-            let q = self.qual(i);
-            let len = s.len().min(n);
-            seq_buf.clear();
-            seq_buf.extend_from_slice(&s[..len]);
-            qual_buf.clear();
-            qual_buf.extend_from_slice(&q[..len]);
-            bld.push(&seq_buf, &qual_buf);
-        }
-        let temp = bld.finish();
-        self.seq = temp.seq;
-        self.qual = temp.qual;
-        self.storage = temp.storage;
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
@@ -1361,7 +1361,8 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(5, 2);
         bld.push(b("HELLO"), b("12345"));
         bld.push(b("WORLD"), b("67890"));
-        let p = bld.finish().max_len(3, None);
+        let mut p = bld.finish();
+        p.max_len(3, None);
         assert!(p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("HEL"));
         assert_eq!(p.qual(0), BStr::new("123"));
@@ -1372,7 +1373,8 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(0, 2);
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("II"));
-        let p = bld.finish().max_len(4, None);
+        let mut p = bld.finish();
+        p.max_len(4, None);
         assert_eq!(p.seq(0), BStr::new("ACGT"));
         assert_eq!(p.qual(0), BStr::new("IIII"));
         assert_eq!(p.seq(1), BStr::new("AC"));
@@ -1474,7 +1476,9 @@ mod tests {
         bld.push(b("HELLO"), b("12345"));
         bld.push(b("WORLD"), b("67890"));
         bld.push(b("RUST!"), b("ABCDE"));
-        let p = bld.finish().max_len(3, Some(&[true, false, true]));
+        let mut p = bld.finish();
+        p.max_len(3, Some(&[true, false, true]));
+        dbg!(&p.storage);
         assert!(!p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("HEL"));
         assert_eq!(p.qual(0), BStr::new("123"));
@@ -1489,7 +1493,8 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(0, 2);
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("JJ"));
-        let p = bld.finish().max_len(4, Some(&[true, false]));
+        let mut p = bld.finish();
+        p.max_len(4, Some(&[true, false]));
         assert_eq!(p.seq(0), BStr::new("ACGT"));
         assert_eq!(p.qual(0), BStr::new("IIII"));
         assert_eq!(p.seq(1), BStr::new("AC")); // untouched
