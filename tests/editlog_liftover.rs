@@ -195,7 +195,9 @@ fn liftover_matches_model_exhaustively_small() {
     for _ in 0..50_000 {
         let orig_len = rng.below(9); // 0..=8
         let count = rng.below(7); // 0..=6 stacked edits
-        let edits: Vec<Edit> = (0..count).map(|_| random_edit(&mut rng, orig_len)).collect();
+        let edits: Vec<Edit> = (0..count)
+            .map(|_| random_edit(&mut rng, orig_len))
+            .collect();
         check_against_model(orig_len, &edits, &mut rng, 0);
     }
 }
@@ -206,7 +208,9 @@ fn liftover_matches_model_larger_frames() {
     for _ in 0..5_000 {
         let orig_len = 8 + rng.below(40);
         let count = rng.below(12);
-        let edits: Vec<Edit> = (0..count).map(|_| random_edit(&mut rng, orig_len)).collect();
+        let edits: Vec<Edit> = (0..count)
+            .map(|_| random_edit(&mut rng, orig_len))
+            .collect();
         check_against_model(orig_len, &edits, &mut rng, 40);
     }
 }
@@ -220,7 +224,10 @@ fn identity_log() {
     assert_eq!(log.op_count(), 0);
     assert_eq!(log.current_len(10), 10);
     assert_eq!(pos(&log, 3, 10), OffsetLift::At(3));
-    assert_eq!(region(&log, 2, 4, 10), RegionLift::Kept { start: 2, len: 4 });
+    assert_eq!(
+        region(&log, 2, 4, 10),
+        RegionLift::Kept { start: 2, len: 4 }
+    );
 }
 
 #[test]
@@ -232,7 +239,10 @@ fn cut_start_shifts_and_deletes() {
     assert_eq!(pos(&log, 3, 10), OffsetLift::At(0)); // first survivor
     assert_eq!(pos(&log, 9, 10), OffsetLift::At(6));
     assert_eq!(region(&log, 1, 4, 10), RegionLift::Dropped); // straddles the cut
-    assert_eq!(region(&log, 3, 4, 10), RegionLift::Kept { start: 0, len: 4 });
+    assert_eq!(
+        region(&log, 3, 4, 10),
+        RegionLift::Kept { start: 0, len: 4 }
+    );
 }
 
 #[test]
@@ -242,7 +252,10 @@ fn cut_end_clips_tail() {
     assert_eq!(log.current_len(10), 7);
     assert_eq!(pos(&log, 6, 10), OffsetLift::At(6));
     assert_eq!(pos(&log, 7, 10), OffsetLift::Deleted);
-    assert_eq!(region(&log, 5, 2, 10), RegionLift::Kept { start: 5, len: 2 });
+    assert_eq!(
+        region(&log, 5, 2, 10),
+        RegionLift::Kept { start: 5, len: 2 }
+    );
     assert_eq!(region(&log, 6, 2, 10), RegionLift::Dropped);
 }
 
@@ -266,7 +279,10 @@ fn splice_grow_and_shrink() {
     assert_eq!(pos(&grow, 3, 10), OffsetLift::At(3)); // before splice
     assert_eq!(pos(&grow, 4, 10), OffsetLift::Deleted); // inside deletion
     assert_eq!(pos(&grow, 6, 10), OffsetLift::At(9)); // after, +3
-    assert_eq!(region(&grow, 0, 4, 10), RegionLift::Kept { start: 0, len: 4 });
+    assert_eq!(
+        region(&grow, 0, 4, 10),
+        RegionLift::Kept { start: 0, len: 4 }
+    );
     assert_eq!(region(&grow, 3, 3, 10), RegionLift::Dropped); // overlaps deletion
 }
 
@@ -276,9 +292,15 @@ fn pure_insertion_boundary_vs_interior() {
     let mut log = EditLog::new();
     log.splice(5, 0, 3);
     // region ending at the insertion's right edge keeps (insert is outside).
-    assert_eq!(region(&log, 2, 3, 10), RegionLift::Kept { start: 2, len: 3 });
+    assert_eq!(
+        region(&log, 2, 3, 10),
+        RegionLift::Kept { start: 2, len: 3 }
+    );
     // region starting at the insertion's left edge keeps, shifted past it.
-    assert_eq!(region(&log, 5, 3, 10), RegionLift::Kept { start: 8, len: 3 });
+    assert_eq!(
+        region(&log, 5, 3, 10),
+        RegionLift::Kept { start: 8, len: 3 }
+    );
     // region straddling the insertion point is split → dropped.
     assert_eq!(region(&log, 4, 3, 10), RegionLift::Dropped);
 }
@@ -291,7 +313,10 @@ fn reflect_mirrors_region() {
     assert_eq!(pos(&log, 0, 10), OffsetLift::At(9));
     assert_eq!(pos(&log, 9, 10), OffsetLift::At(0));
     // region [2,5) → mirror span [10-5, 10-2) = [5,8)
-    assert_eq!(region(&log, 2, 3, 10), RegionLift::Kept { start: 5, len: 3 });
+    assert_eq!(
+        region(&log, 2, 3, 10),
+        RegionLift::Kept { start: 5, len: 3 }
+    );
 }
 
 #[test]
@@ -301,7 +326,10 @@ fn stacked_cut_prefix_reflect() {
     log.cut_start(2);
     log.prefix(2);
     log.reflect();
-    assert_eq!(region(&log, 4, 4, 12), RegionLift::Kept { start: 4, len: 4 });
+    assert_eq!(
+        region(&log, 4, 4, 12),
+        RegionLift::Kept { start: 4, len: 4 }
+    );
 }
 
 // ── error reporting (formerly panics) ───────────────────────────────────────
@@ -343,11 +371,16 @@ fn map_position_rejects_oob() {
 fn view_from_end_is_identity() {
     let mut log = EditLog::new();
     log.cut_start(2);
-    let view = log.view_from(log.op_count()).expect("end is a valid generation");
+    let view = log
+        .view_from(log.op_count())
+        .expect("end is a valid generation");
     assert!(view.is_empty());
     assert_eq!(view.current_len(10), 10);
     assert_eq!(view.map_position(0, 10), Ok(OffsetLift::At(0)));
-    assert_eq!(view.map_region(0, 4, 10), Ok(RegionLift::Kept { start: 0, len: 4 }));
+    assert_eq!(
+        view.map_region(0, 4, 10),
+        Ok(RegionLift::Kept { start: 0, len: 4 })
+    );
 }
 
 #[test]
@@ -472,7 +505,10 @@ fn alias_born_midway_lifts_via_view_from() {
 
     // Lift the tag's birth-frame region through just the post-birth edits.
     let view = log.view_from(born).expect("valid generation");
-    match view.map_region(2, 4, born_len).expect("birth region in bounds") {
+    match view
+        .map_region(2, 4, born_len)
+        .expect("birth region in bounds")
+    {
         RegionLift::Kept { start, len } => {
             let mut reversed = b"ACGT".to_vec();
             reversed.reverse();

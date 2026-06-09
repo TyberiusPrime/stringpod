@@ -108,7 +108,8 @@ pub trait Lifted {
     /// Record a length-changing write-back into a single read: delete `del`
     /// bytes at offset `at` and insert `ins`. A no-op if `row` is out of range.
     fn record_splice(&mut self, row: usize, at: usize, del: usize, ins: usize) {
-        self.edits_mut().apply_entry(row, |log| log.splice(at, del, ins));
+        self.edits_mut()
+            .apply_entry(row, |log| log.splice(at, del, ins));
     }
 
     // ── row-axis: keep the per-entry logs aligned with the live entries ───────

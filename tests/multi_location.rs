@@ -6,7 +6,8 @@
 //! how the source is later edited (overlay cut, rebuild, in-place reverse); and
 //! row-axis ops keep the snapshot aligned with the reads.
 
-use bstr::BStr;
+use bstr::{BStr, BString};
+use std::borrow::Cow;
 use stringpod::{DualStringPod, DualStringPodBuilder, StringPod, StringPodBuilder};
 
 fn read_pod(entries: &[(&str, &str)]) -> DualStringPod {
@@ -46,9 +47,9 @@ fn aliases_multi_hit_and_no_hit_rows() {
     assert_eq!(snap.pair(2, 0), (BStr::new("CCCC"), BStr::new("2222")));
 
     // joined: borrow for single, allocate (with separator) for multi.
-    assert_eq!(snap.joined_seq(0, Some(b"-")).as_ref(), b"ACGT-ACGT");
-    assert_eq!(snap.joined_qual(0, None).as_ref(), b"IIIIJJJJ");
-    assert_eq!(snap.joined_seq(2, None).as_ref(), b"CCCC");
+    assert_eq!(&*snap.joined_seq(0, Some(b"-")), BStr::new("ACGT-ACGT"));
+    assert_eq!(&*snap.joined_qual(0, None), BStr::new("IIIIJJJJ"));
+    assert_eq!(&*snap.joined_seq(2, None), BStr::new("CCCC"));
 
     let row0: Vec<_> = snap.iter_row(0).collect();
     assert_eq!(row0.len(), 2);
@@ -60,10 +61,7 @@ fn loc_region_returns_captured_read_relative_coords() {
     // within the source entry's visible bytes — regardless of where that entry
     // sits in the shared buffer. That coordinate is what the read pod's edit log
     // lifts; it is independent of the base offset used to slice the frozen bytes.
-    let source = read_pod(&[
-        ("ACGTACGTACGT", "IIIIFFFFJJJJ"),
-        ("TTTTGGGG", "11112222"),
-    ]);
+    let source = read_pod(&[("ACGTACGTACGT", "IIIIFFFFJJJJ"), ("TTTTGGGG", "11112222")]);
     let snap = {
         let mut b = source.multi_location_alias_builder();
         b.push_row(&[(0, 4), (8, 4)]);
@@ -81,6 +79,60 @@ fn loc_region_returns_captured_read_relative_coords() {
     // and the coordinate still slices the right frozen bytes.
     assert_eq!(snap.seq(1, 0), BStr::new("GGGG"));
     assert_eq!(snap.qual(1, 0), BStr::new("2222"));
+}
+
+#[test]
+fn iter_seq_qual_pair_yield_per_row_captured_values() {
+    let source = read_pod(&[
+        ("ACGTACGTACGT", "IIIIFFFFJJJJ"), // two hits
+        ("TTTTTTTT", "########"),         // no hit
+        ("GGGGCCCC", "11112222"),         // one hit
+    ]);
+    let snap = {
+        let mut b = source.multi_location_alias_builder();
+        b.push_row(&[(0, 4), (8, 4)]); // "ACGT"+"ACGT" / "IIII"+"JJJJ"
+        b.push_row(&[]);
+        b.push_row(&[(4, 4)]); // "CCCC" / "2222"
+        b.finish()
+    };
+
+    // no-hit row 1 → `None`; hit rows → `Some(joined)`.
+    let seqs: Vec<Option<BString>> = snap.iter_seq().map(|o| o.map(Cow::into_owned)).collect();
+    assert_eq!(
+        seqs,
+        vec![
+            Some(BString::from("ACGTACGT")),
+            None,
+            Some(BString::from("CCCC"))
+        ]
+    );
+
+    let quals: Vec<Option<BString>> = snap.iter_qual().map(|o| o.map(Cow::into_owned)).collect();
+    assert_eq!(
+        quals,
+        vec![
+            Some(BString::from("IIIIJJJJ")),
+            None,
+            Some(BString::from("2222"))
+        ]
+    );
+
+    // `iter()` is ExactSize over rows; `&snap` (IntoIterator) yields one
+    // `Option<(seq, qual)>` per row — `None` for the no-hit row.
+    assert_eq!(snap.iter().len(), 3);
+    let mut pairs: Vec<Option<(BString, BString)>> = Vec::new();
+    for pair in &snap {
+        pairs.push(pair.map(|(s, q)| (s.into_owned(), q.into_owned())));
+    }
+    assert_eq!(
+        pairs[0],
+        Some((BString::from("ACGTACGT"), BString::from("IIIIJJJJ")))
+    );
+    assert_eq!(pairs[1], None);
+    assert_eq!(
+        pairs[2],
+        Some((BString::from("CCCC"), BString::from("2222")))
+    );
 }
 
 #[test]

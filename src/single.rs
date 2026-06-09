@@ -557,7 +557,7 @@ impl StringPodBuilder {
     /// You probably want to use `with_capacity` if you have an idea
     /// of the target sizes
     #[must_use]
-    #[expect(clippy::new_without_default,reason="I don't want to promote this")]
+    #[expect(clippy::new_without_default, reason = "I don't want to promote this")]
     pub fn new() -> Self {
         Self::with_capacity(0, 0)
     }

@@ -22,7 +22,7 @@
 //! start + first_byte` slices the frozen bytes, while `start` on its own is the
 //! liftable read coordinate.
 
-use bstr::BStr;
+use bstr::{BStr, BString};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::ops::Range;
@@ -161,7 +161,7 @@ impl DualStringPodMultiLocation {
     /// # Panics
     /// If `row >= self.row_count()`.
     #[must_use]
-    pub fn joined_seq(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, [u8]> {
+    pub fn joined_seq(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         join(&self.seq, self.seq_first_byte, &self.rows[row], sep)
     }
 
@@ -171,8 +171,32 @@ impl DualStringPodMultiLocation {
     /// # Panics
     /// If `row >= self.row_count()`.
     #[must_use]
-    pub fn joined_qual(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, [u8]> {
+    pub fn joined_qual(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         join(&self.qual, self.qual_first_byte, &self.rows[row], sep)
+    }
+
+    /// Iterate every row's captured sequence — one item per row, the row's
+    /// locations concatenated; a no-hit row (no stored locations) yields `None`.
+    /// Borrows for single-location rows, allocates only for multi-location ones;
+    /// use [`joined_seq`](Self::joined_seq) if you need a separator.
+    pub fn iter_seq(&self) -> impl Iterator<Item = Option<Cow<'_, BStr>>> {
+        (0..self.rows.len())
+            .map(move |row| (!self.rows[row].locs.is_empty()).then(|| self.joined_seq(row, None)))
+    }
+
+    /// Iterate every row's captured quality — the quality counterpart of
+    /// [`iter_seq`](Self::iter_seq); a no-hit row yields `None`.
+    pub fn iter_qual(&self) -> impl Iterator<Item = Option<Cow<'_, BStr>>> {
+        (0..self.rows.len())
+            .map(move |row| (!self.rows[row].locs.is_empty()).then(|| self.joined_qual(row, None)))
+    }
+
+    /// Iterate every row's captured `(seq, qual)` pair — [`iter_seq`](Self::iter_seq)
+    /// and [`iter_qual`](Self::iter_qual) walked in lockstep, one item per row
+    /// (`None` for a no-hit row). Equivalent to `(&pod).into_iter()`.
+    #[must_use]
+    pub fn iter(&self) -> PairIter<'_> {
+        PairIter { pod: self, row: 0 }
     }
 
     // ── row-axis: keep the snapshot aligned with the live reads ──────────────
@@ -183,6 +207,16 @@ impl DualStringPodMultiLocation {
     /// If the range is out of bounds.
     pub fn drain(&mut self, range: Range<usize>) {
         self.rows.drain(range);
+    }
+
+    /// Poor man's retain, where the F doesn't get to look
+    /// at the actual contents.
+    /// Mostly use ful for filtering on a bool iter of the same length
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut() -> bool,
+    {
+        self.rows.retain(|_| f());
     }
 
     /// Drop the first `n` rows (mirrors `pop_front`).
@@ -228,15 +262,59 @@ impl std::fmt::Debug for DualStringPodMultiLocation {
     }
 }
 
+/// Iterator over a [`DualStringPodMultiLocation`]'s captured `(seq, qual)` pairs,
+/// one item per row (`None` for a no-hit row). Created by
+/// [`DualStringPodMultiLocation::iter`] or by iterating `&pod`. Borrows single-
+/// location rows, allocates only for multi-location ones.
+pub struct PairIter<'a> {
+    pod: &'a DualStringPodMultiLocation,
+    row: usize,
+}
+
+impl<'a> Iterator for PairIter<'a> {
+    type Item = Option<(Cow<'a, BStr>, Cow<'a, BStr>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row >= self.pod.rows.len() {
+            return None;
+        }
+        let row = self.row;
+        self.row += 1;
+        let pair = (!self.pod.rows[row].locs.is_empty()).then(|| {
+            (
+                self.pod.joined_seq(row, None),
+                self.pod.joined_qual(row, None),
+            )
+        });
+        Some(pair)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.pod.rows.len() - self.row;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for PairIter<'_> {}
+
+impl<'a> IntoIterator for &'a DualStringPodMultiLocation {
+    type Item = Option<(Cow<'a, BStr>, Cow<'a, BStr>)>;
+    type IntoIter = PairIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        PairIter { pod: self, row: 0 }
+    }
+}
+
 /// Join a row's read-relative locations out of `buf` (offset by the row's `base`
 /// plus the buffer's `first` byte), borrowing the single-location case.
-fn join<'a>(buf: &'a [u8], first: usize, row: &Row, sep: Option<&[u8]>) -> Cow<'a, [u8]> {
+fn join<'a>(buf: &'a [u8], first: usize, row: &Row, sep: Option<&[u8]>) -> Cow<'a, BStr> {
     let off = row.base as usize + first;
     match row.locs.as_slice() {
-        [] => Cow::Borrowed(&[]),
+        [] => Cow::Borrowed(BStr::new(b"")),
         [(rel, len)] => {
             let s = off + *rel as usize;
-            Cow::Borrowed(&buf[s..s + *len as usize])
+            Cow::Borrowed(BStr::new(&buf[s..s + *len as usize]))
         }
         many => {
             let mut out = Vec::new();
@@ -249,7 +327,7 @@ fn join<'a>(buf: &'a [u8], first: usize, row: &Row, sep: Option<&[u8]>) -> Cow<'
                 let s = off + rel as usize;
                 out.extend_from_slice(&buf[s..s + len as usize]);
             }
-            Cow::Owned(out)
+            Cow::Owned(BString::from(out))
         }
     }
 }

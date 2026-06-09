@@ -12,7 +12,14 @@
 use bstr::BStr;
 use stringpod::{DualStringPod, DualStringPodBuilder, Lifted, RegionLift};
 
-fn lift(pod: &DualStringPod, born: usize, row: usize, start: usize, len: usize, orig: usize) -> RegionLift {
+fn lift(
+    pod: &DualStringPod,
+    born: usize,
+    row: usize,
+    start: usize,
+    len: usize,
+    orig: usize,
+) -> RegionLift {
     pod.ops_since(born, row)
         .expect("row & generation in range")
         .map_region(start, len, orig)

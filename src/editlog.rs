@@ -149,14 +149,24 @@ impl std::fmt::Display for EditLogError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match *self {
             EditLogError::PositionOutOfBounds { position, orig_len } => {
-                write!(f, "position {position} out of bounds for original length {orig_len}")
+                write!(
+                    f,
+                    "position {position} out of bounds for original length {orig_len}"
+                )
             }
             EditLogError::EmptyRegion => f.write_str("a region must cover at least one byte"),
-            EditLogError::RegionOutOfBounds { start, len, orig_len } => write!(
+            EditLogError::RegionOutOfBounds {
+                start,
+                len,
+                orig_len,
+            } => write!(
                 f,
                 "region [{start}, {start} + {len}) exceeds original length {orig_len}"
             ),
-            EditLogError::GenerationOutOfRange { generation, recorded } => write!(
+            EditLogError::GenerationOutOfRange {
+                generation,
+                recorded,
+            } => write!(
                 f,
                 "generation {generation} is past the {recorded} recorded edit(s)"
             ),
@@ -188,7 +198,11 @@ fn current_len_in(ops: &[Op], orig_len: usize) -> usize {
 }
 
 /// Forward-replay `position` through `ops` (shared by [`EditLog`] and [`EditLogView`]).
-fn map_position_in(ops: &[Op], position: usize, orig_len: usize) -> Result<OffsetLift, EditLogError> {
+fn map_position_in(
+    ops: &[Op],
+    position: usize,
+    orig_len: usize,
+) -> Result<OffsetLift, EditLogError> {
     if position >= orig_len {
         return Err(EditLogError::PositionOutOfBounds { position, orig_len });
     }
@@ -246,7 +260,13 @@ fn map_region_in(
     }
     match start.checked_add(len) {
         Some(end) if end <= orig_len => {}
-        _ => return Err(EditLogError::RegionOutOfBounds { start, len, orig_len }),
+        _ => {
+            return Err(EditLogError::RegionOutOfBounds {
+                start,
+                len,
+                orig_len,
+            });
+        }
     }
     let mut lo = usize::MAX;
     let mut hi = 0usize;
@@ -374,7 +394,11 @@ impl EditLog {
     ///
     /// # Errors
     /// [`EditLogError::PositionOutOfBounds`] if `position >= orig_len`.
-    pub fn map_position(&self, position: usize, orig_len: usize) -> Result<OffsetLift, EditLogError> {
+    pub fn map_position(
+        &self,
+        position: usize,
+        orig_len: usize,
+    ) -> Result<OffsetLift, EditLogError> {
         map_position_in(&self.ops, position, orig_len)
     }
 
@@ -388,7 +412,12 @@ impl EditLog {
     /// # Errors
     /// [`EditLogError::EmptyRegion`] if `len == 0`; [`EditLogError::RegionOutOfBounds`]
     /// if `start + len > orig_len`.
-    pub fn map_region(&self, start: usize, len: usize, orig_len: usize) -> Result<RegionLift, EditLogError> {
+    pub fn map_region(
+        &self,
+        start: usize,
+        len: usize,
+        orig_len: usize,
+    ) -> Result<RegionLift, EditLogError> {
         map_region_in(&self.ops, start, len, orig_len)
     }
 }
@@ -426,7 +455,11 @@ impl EditLogView<'_> {
     ///
     /// # Errors
     /// [`EditLogError::PositionOutOfBounds`] if `position >= orig_len`.
-    pub fn map_position(&self, position: usize, orig_len: usize) -> Result<OffsetLift, EditLogError> {
+    pub fn map_position(
+        &self,
+        position: usize,
+        orig_len: usize,
+    ) -> Result<OffsetLift, EditLogError> {
         map_position_in(self.ops, position, orig_len)
     }
 
@@ -435,7 +468,12 @@ impl EditLogView<'_> {
     /// # Errors
     /// [`EditLogError::EmptyRegion`] if `len == 0`; [`EditLogError::RegionOutOfBounds`]
     /// if `start + len > orig_len`.
-    pub fn map_region(&self, start: usize, len: usize, orig_len: usize) -> Result<RegionLift, EditLogError> {
+    pub fn map_region(
+        &self,
+        start: usize,
+        len: usize,
+        orig_len: usize,
+    ) -> Result<RegionLift, EditLogError> {
         map_region_in(self.ops, start, len, orig_len)
     }
 }
