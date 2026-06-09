@@ -2,6 +2,8 @@ use bstr::{BStr, ByteSlice as _};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::column::ColumnEdits;
+use crate::lifted::Lifted;
 use crate::storage::{Storage, VariableInfo};
 
 /// A single column of byte strings backed by one shared `Arc<[u8]>` and a
@@ -14,6 +16,18 @@ pub struct StringPod {
     // whenever the builder over-reserved.
     pub(crate) data: Arc<Vec<u8>>,
     pub(crate) storage: Storage,
+
+    /// Per-entry coordinate-edit history for liftover (see [`Lifted`]).
+    pub(crate) edits: ColumnEdits,
+}
+
+impl Lifted for StringPod {
+    fn edits(&self) -> &ColumnEdits {
+        &self.edits
+    }
+    fn edits_mut(&mut self) -> &mut ColumnEdits {
+        &mut self.edits
+    }
 }
 
 impl StringPod {
@@ -28,6 +42,7 @@ impl StringPod {
                 count,
                 front_byte: 0,
             },
+            edits: ColumnEdits::new(count as usize),
         }
     }
 
@@ -112,6 +127,7 @@ impl StringPod {
     pub fn cut_start(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         self.storage.cut_start(n_u32, conditional);
+        self.record_cut_start(n, conditional);
     }
 
     /// Cut `n` bytes off the end of every entry. O(1).
@@ -121,6 +137,7 @@ impl StringPod {
     pub fn cut_end(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         self.storage.cut_end(n_u32, conditional);
+        self.record_cut_end(n, conditional);
     }
 
     /// Remove a contiguous range of entries. Promotes `FixedLength` → `Variable`.
@@ -131,12 +148,15 @@ impl StringPod {
     pub fn drain(&mut self, range: Range<usize>) {
         assert!(range.start <= range.end, "drain range start > end");
         assert!(range.end <= self.len(), "drain range past end of pod");
+        let (start, end) = (range.start, range.end);
         self.storage.drain(range);
+        self.record_drain(start..end);
     }
 
     /// Keep only entries where the boolean is true
     pub fn retain_by_bools(&mut self, keep: &[bool]) {
         self.storage.retain_by_bools(keep);
+        self.record_retain(keep);
     }
 
     /// Append one entry to a *finished* pod, mirroring builder semantics
@@ -157,6 +177,7 @@ impl StringPod {
             if bytes.len() as u64 == u64::from(stride) {
                 data.extend_from_slice(bytes);
                 self.storage.builder_push_strided();
+                self.edits.push_entry();
                 return;
             }
         }
@@ -164,17 +185,20 @@ impl StringPod {
         let stop = u32::try_from(data.len() + bytes.len()).expect("byte buffer exceeds u32::MAX");
         data.extend_from_slice(bytes);
         self.storage.builder_push_position(start, stop);
+        self.edits.push_entry();
     }
 
     /// Drop the first `n` entries from the view. O(1): a byte offset on
     /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
     pub fn pop_front(&mut self, n: usize) {
         self.storage.pop_front(u32::try_from(n).unwrap_or(u32::MAX));
+        self.record_pop_front(n);
     }
 
     /// Truncate the view to at most `len` entries (drops from the back). O(1).
     pub fn truncate(&mut self, len: usize) {
         self.storage.truncate(len);
+        self.record_truncate(len);
     }
 
     /// Ensure the buffer has spare capacity for roughly `n` more average-sized
@@ -215,7 +239,11 @@ impl StringPod {
             buf.extend_from_slice(self.get(i));
             bld.push(&buf);
         }
-        bld.finish()
+        // Carry the edit history across the rebuild and append the prefix op.
+        let mut out = bld.finish();
+        out.edits = self.edits;
+        out.record_prefix(text.len());
+        out
     }
 
     /// Append `text` to every entry, rebuilding the byte buffer.
@@ -238,7 +266,10 @@ impl StringPod {
             buf.extend_from_slice(text);
             bld.push(&buf);
         }
-        bld.finish()
+        let mut out = bld.finish();
+        out.edits = self.edits;
+        out.record_postfix(text.len());
+        out
     }
 
     /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
@@ -250,24 +281,42 @@ impl StringPod {
     #[must_use]
     pub fn max_len(mut self, n: usize, conditional: Option<&[bool]>) -> Self {
         if let Some(cond) = conditional {
+            let count = self.len();
+            let windows: Vec<Option<(usize, usize, usize)>> = (0..count)
+                .map(|i| {
+                    let cur = self.entry_len(i);
+                    (cond[i] && cur > n).then_some((0, n, cur))
+                })
+                .collect();
             let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
             self.storage.truncate_bytes_conditional(n_u32, cond);
+            self.record_windows(&windows);
             return self;
         }
         if let Storage::FixedLength { visible_len, .. } = self.storage {
             let vl = visible_len as usize;
             if vl > n {
+                // `cut_end` records the (uniform) coordinate edit itself.
                 self.cut_end(vl - n, None);
             }
             return self;
         }
         let count = self.len();
+        let windows: Vec<Option<(usize, usize, usize)>> = (0..count)
+            .map(|i| {
+                let cur = self.entry_len(i);
+                (cur > n).then_some((0, n, cur))
+            })
+            .collect();
         let mut bld = StringPodBuilder::with_capacity(n, count);
         for i in 0..count {
             let entry = self.get(i);
             bld.push(&entry[..entry.len().min(n)]);
         }
-        bld.finish()
+        let mut out = bld.finish();
+        out.edits = self.edits;
+        out.record_windows(&windows);
+        out
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
@@ -285,11 +334,18 @@ impl StringPod {
     /// [`cut_end`](Self::cut_end), and [`max_len`](Self::max_len) for the case
     /// where each entry needs an individually-chosen cut (e.g. trimming every
     /// read at a per-read location). Promotes `FixedLength` → `Variable`.
-    pub fn resize<F>(&mut self, f: F)
+    pub fn resize<F>(&mut self, mut f: F)
     where
         F: FnMut(usize, &BStr) -> Option<(usize, usize)>,
     {
-        self.storage.resize_each(&self.data, f);
+        let mut windows: Vec<Option<(usize, usize, usize)>> = Vec::new();
+        self.storage.resize_each(&self.data, |i, bytes| {
+            let cur = bytes.len();
+            let kept = f(i, bytes);
+            windows.push(kept.map(|(st, ln)| (st, ln, cur)));
+            kept
+        });
+        self.record_windows(&windows);
     }
 
     /// Reverse the bytes of every entry in-place. If the byte buffer is
@@ -299,13 +355,11 @@ impl StringPod {
     /// are reversed.
     #[must_use]
     pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
-        if Arc::get_mut(&mut self.data).is_none() {
-            self.data = Arc::new((*self.data).clone());
-        }
-        let data = Arc::get_mut(&mut self.data).expect("just ensured unique");
+        self.record_reverse(conditional);
+        let data = Arc::make_mut(&mut self.data);
         let n = self.storage.len();
         for i in 0..n {
-            if conditional.map_or(true, |c| c[i]) {
+            if conditional.is_none_or(|c| c[i]) {
                 let r = self.storage.entry_range(i);
                 data[r].reverse();
             }
@@ -340,7 +394,6 @@ impl StringPod {
     }
 
     /// iterate across the lengths
-    #[must_use]
     pub fn iter_lens(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).map(move |i| self.entry_len(i))
     }
@@ -501,9 +554,10 @@ pub struct StringPodBuilder {
 
 impl StringPodBuilder {
     /// Create a builder, without preallocating anything.
-    /// You probably want to use with_capacity if you have an idea
+    /// You probably want to use `with_capacity` if you have an idea
     /// of the target sizes
     #[must_use]
+    #[expect(clippy::new_without_default,reason="I don't want to promote this")]
     pub fn new() -> Self {
         Self::with_capacity(0, 0)
     }
@@ -570,9 +624,11 @@ impl StringPodBuilder {
     /// reallocating (any over-reserved capacity is retained, not copied away).
     #[must_use]
     pub fn finish(self) -> StringPod {
+        let count = self.storage.len();
         StringPod {
             data: Arc::new(self.data),
             storage: self.storage,
+            edits: ColumnEdits::new(count),
         }
     }
 }
@@ -644,6 +700,7 @@ impl StringPodAliasBuilder<'_> {
     /// non-contiguous regions of the shared buffer).
     #[must_use]
     pub fn finish(self) -> StringPod {
+        let count = self.positions.len();
         StringPod {
             data: Arc::clone(&self.source.data),
             storage: Storage::Variable(VariableInfo {
@@ -652,6 +709,7 @@ impl StringPodAliasBuilder<'_> {
                 tail_skip: 0,
                 front_skip: 0,
             }),
+            edits: ColumnEdits::new(count),
         }
     }
 }
@@ -1693,7 +1751,7 @@ mod tests {
         }
         let p2 = StringPod::new_all_empty(10);
         assert_eq!(p2.len(), 10);
-        for astring in p2.iter() {
+        for astring in &p2 {
             assert!(astring.is_empty());
         }
     }

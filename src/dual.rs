@@ -2,6 +2,8 @@ use bstr::{BStr, ByteSlice as _};
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::column::ColumnEdits;
+use crate::lifted::Lifted;
 use crate::single::StringPod;
 use crate::storage::{Storage, VariableInfo};
 
@@ -56,6 +58,18 @@ pub struct DualStringPod {
 
     pub(crate) seq_first_byte: usize,
     pub(crate) qual_first_byte: usize,
+
+    /// Per-entry coordinate-edit history for liftover (see [`Lifted`]).
+    pub(crate) edits: ColumnEdits,
+}
+
+impl Lifted for DualStringPod {
+    fn edits(&self) -> &ColumnEdits {
+        &self.edits
+    }
+    fn edits_mut(&mut self) -> &mut ColumnEdits {
+        &mut self.edits
+    }
 }
 
 impl DualStringPod {
@@ -96,6 +110,7 @@ impl DualStringPod {
         if seq.len() != qual.len() {
             return Err(ColumnError::EqualCountViolated);
         }
+        let count = seq.len();
 
         // Fast path: both columns are fixed-length with an identical *relative*
         // layout (same stride / cut overlay / count). Only their `front_byte`
@@ -137,6 +152,7 @@ impl DualStringPod {
                     storage,
                     seq_first_byte: *seq_front_byte as usize,
                     qual_first_byte: *qual_front_byte as usize,
+                    edits: ColumnEdits::new(count),
                 });
             }
         }
@@ -180,6 +196,7 @@ impl DualStringPod {
             storage,
             seq_first_byte: base_seq,
             qual_first_byte: base_qual,
+            edits: ColumnEdits::new(count),
         })
     }
 
@@ -300,6 +317,7 @@ impl DualStringPod {
     pub fn cut_start(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         self.storage.cut_start(n_u32, conditional);
+        self.record_cut_start(n, conditional);
     }
 
     /// Cut `n` bytes off the end of every entry (both seq and qual). O(1).
@@ -309,17 +327,20 @@ impl DualStringPod {
     pub fn cut_end(&mut self, n: usize, conditional: Option<&[bool]>) {
         let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         self.storage.cut_end(n_u32, conditional);
+        self.record_cut_end(n, conditional);
     }
 
     /// Drop the first `n` entries from the view. O(1): a byte offset on
     /// `FixedLength`, an entry-index skip on `Variable`. No bytes move.
     pub fn pop_front(&mut self, n: usize) {
         self.storage.pop_front(u32::try_from(n).unwrap_or(u32::MAX));
+        self.record_pop_front(n);
     }
 
     /// Truncate the view to at most `len` entries (drops from the back). O(1).
     pub fn truncate(&mut self, len: usize) {
         self.storage.truncate(len);
+        self.record_truncate(len);
     }
 
     /// # Panics
@@ -327,7 +348,9 @@ impl DualStringPod {
     pub fn drain(&mut self, range: Range<usize>) {
         assert!(range.start <= range.end, "drain range start > end");
         assert!(range.end <= self.len(), "drain range past end of pod");
+        let (start, end) = (range.start, range.end);
         self.storage.drain(range);
+        self.record_drain(start..end);
     }
 
     #[must_use]
@@ -360,7 +383,6 @@ impl DualStringPod {
         }
     }
 
-    #[must_use]
     pub fn iter_seq_lens(&self) -> impl Iterator<Item = usize> + '_ {
         (0..self.len()).map(move |i| self.storage.entry_len(i))
     }
@@ -398,7 +420,12 @@ impl DualStringPod {
             qual_buf.extend_from_slice(self.qual(i));
             bld.push(&seq_buf, &qual_buf);
         }
-        bld.finish()
+        // Carry the edit history across the rebuild (the Arc diverges here, so
+        // the snapshot bytes part company from the live ones) and append the op.
+        let mut out = bld.finish();
+        out.edits = self.edits;
+        out.record_prefix(seq_text.len());
+        out
     }
 
     /// Append `seq_text` / `qual_text` to every entry in the respective
@@ -434,7 +461,10 @@ impl DualStringPod {
             qual_buf.extend_from_slice(qual_text);
             bld.push(&seq_buf, &qual_buf);
         }
-        bld.finish()
+        let mut out = bld.finish();
+        out.edits = self.edits;
+        out.record_postfix(seq_text.len());
+        out
     }
 
     /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
@@ -443,6 +473,18 @@ impl DualStringPod {
     /// If `conditional` is `Some`, only entries where the boolean is `true`
     /// are clipped; this promotes `FixedLength` → `Variable`.
     pub fn max_len(&mut self, n: usize, conditional: Option<&[bool]>) {
+        let count = self.len();
+        // Capture each entry's keep-window from its *current* length, before any
+        // mutation; "keep first min(len, n)". Recorded once at the end so the
+        // FixedLength fast path and the Variable rebuild log identically.
+        let windows: Vec<Option<(usize, usize, usize)>> = (0..count)
+            .map(|i| {
+                let affected = conditional.is_none_or(|c| c[i]);
+                let cur = self.entry_len(i);
+                (affected && cur > n).then_some((0, n, cur))
+            })
+            .collect();
+
         if let Some(cond) = conditional {
             let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
             self.storage.truncate_bytes_conditional(n_u32, cond);
@@ -450,10 +492,12 @@ impl DualStringPod {
             if let Storage::FixedLength { visible_len, .. } = self.storage {
                 let vl = visible_len as usize;
                 if vl > n {
-                    self.cut_end(vl - n, None);
+                    // storage-level cut: the coordinate edit is logged via
+                    // `record_windows` below, so don't double-record here.
+                    self.storage
+                        .cut_end(u32::try_from(vl - n).unwrap_or(u32::MAX), None);
                 }
             }
-            let count = self.len();
             let mut bld = DualStringPodBuilder::with_capacity(n, count);
             let mut seq_buf = Vec::with_capacity(n);
             let mut qual_buf = Vec::with_capacity(n);
@@ -472,6 +516,7 @@ impl DualStringPod {
             self.qual = temp.qual;
             self.storage = temp.storage;
         }
+        self.record_windows(&windows);
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
@@ -496,16 +541,22 @@ impl DualStringPod {
         let qual = &self.qual;
         let sf = self.seq_first_byte;
         let qf = self.qual_first_byte;
+        let mut windows: Vec<Option<(usize, usize, usize)>> = Vec::new();
         self.storage.resize_positions(|i, start, stop| {
             let (s, e) = (start as usize, stop as usize);
+            let cur = e - s;
             let seq_bytes = BStr::new(&seq[s + sf..e + sf]);
             let qual_bytes = BStr::new(&qual[s + qf..e + qf]);
-            f(i, seq_bytes, qual_bytes)
+            let kept = f(i, seq_bytes, qual_bytes);
+            windows.push(kept.map(|(st, ln)| (st, ln, cur)));
+            kept
         });
+        self.record_windows(&windows);
     }
 
     pub fn retain_by_bools(&mut self, keep: &[bool]) {
         self.storage.retain_by_bools(keep);
+        self.record_retain(keep);
     }
 
     /// Reverse the bytes of every entry in both columns in-place. If either
@@ -516,19 +567,14 @@ impl DualStringPod {
     /// are reversed.
     #[must_use]
     pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
-        if Arc::get_mut(&mut self.seq).is_none() {
-            self.seq = Arc::new((*self.seq).clone());
-        }
-        if Arc::get_mut(&mut self.qual).is_none() {
-            self.qual = Arc::new((*self.qual).clone());
-        }
+        self.record_reverse(conditional);
         let seq_first_byte = self.seq_first_byte;
         let qual_first_byte = self.qual_first_byte;
         let n = self.storage.len();
-        let seq = Arc::get_mut(&mut self.seq).expect("just ensured unique");
-        let qual = Arc::get_mut(&mut self.qual).expect("just ensured unique");
+        let seq = Arc::make_mut(&mut self.seq);
+        let qual = Arc::make_mut(&mut self.qual);
         for i in 0..n {
-            if conditional.map_or(true, |c| c[i]) {
+            if conditional.is_none_or(|c| c[i]) {
                 let r = self.storage.entry_range(i);
                 seq[r.start + seq_first_byte..r.end + seq_first_byte].reverse();
                 qual[r.start + qual_first_byte..r.end + qual_first_byte].reverse();
@@ -849,12 +895,14 @@ impl DualStringPodBuilder {
 
     #[must_use]
     pub fn finish(self) -> DualStringPod {
+        let count = self.storage.len();
         DualStringPod {
             seq: Arc::new(self.seq),
             qual: Arc::new(self.qual),
             storage: self.storage,
             seq_first_byte: 0,
             qual_first_byte: 0,
+            edits: ColumnEdits::new(count),
         }
     }
 }
@@ -926,6 +974,7 @@ impl DualStringPodAliasBuilder<'_> {
     /// Finalise the alias builder, releasing the borrow of the source pod.
     #[must_use]
     pub fn finish(self) -> DualStringPod {
+        let count = self.positions.len();
         DualStringPod {
             seq: Arc::clone(&self.source.seq),
             qual: Arc::clone(&self.source.qual),
@@ -937,6 +986,7 @@ impl DualStringPodAliasBuilder<'_> {
             }),
             seq_first_byte: 0,
             qual_first_byte: 0,
+            edits: ColumnEdits::new(count),
         }
     }
 }
@@ -1478,7 +1528,6 @@ mod tests {
         bld.push(b("RUST!"), b("ABCDE"));
         let mut p = bld.finish();
         p.max_len(3, Some(&[true, false, true]));
-        dbg!(&p.storage);
         assert!(!p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("HEL"));
         assert_eq!(p.qual(0), BStr::new("123"));

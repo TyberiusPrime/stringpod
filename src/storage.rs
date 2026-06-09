@@ -111,7 +111,7 @@ impl Storage {
                     usize::try_from(stop).expect("entry stop exceeds usize on this platform");
                 start_u..stop_u
             }
-            Storage::Variable (VariableInfo{
+            Storage::Variable(VariableInfo {
                 ref positions,
                 head_skip,
                 tail_skip,
@@ -136,7 +136,7 @@ impl Storage {
 
     pub(crate) fn cut_start(&mut self, n: u32, conditional: Option<&[bool]>) {
         assert!(
-            conditional.is_none() || conditional.as_ref().unwrap().len() == self.len(),
+            conditional.is_none_or(|cond| cond.len() == self.len()),
             "Length of conditional bools must match number of entries"
         );
         if let Some(conditional) = conditional {
@@ -162,7 +162,7 @@ impl Storage {
                     *head_skip = new_head;
                     *visible_len = visible_len.saturating_sub(delta);
                 }
-                Storage::Variable (VariableInfo { head_skip, .. }) => {
+                Storage::Variable(VariableInfo { head_skip, .. }) => {
                     *head_skip = head_skip.saturating_add(n);
                 }
             }
@@ -171,7 +171,7 @@ impl Storage {
 
     pub(crate) fn cut_end(&mut self, n: u32, conditional: Option<&[bool]>) {
         assert!(
-            conditional.is_none() || conditional.as_ref().unwrap().len() == self.len(),
+            conditional.is_none_or(|cond| cond.len() == self.len()),
             "Length of conditional bools must match number of entries"
         );
         if let Some(conditional) = conditional {
@@ -320,7 +320,7 @@ impl Storage {
                     .unwrap_or(u32::MAX);
                 *count -= n;
             }
-            Storage::Variable (VariableInfo {
+            Storage::Variable(VariableInfo {
                 positions,
                 front_skip,
                 ..
@@ -340,7 +340,7 @@ impl Storage {
                     *count = len as u32;
                 }
             }
-            Storage::Variable (VariableInfo {
+            Storage::Variable(VariableInfo {
                 positions,
                 front_skip,
                 ..
@@ -359,7 +359,7 @@ impl Storage {
             Storage::FixedLength {
                 visible_len, count, ..
             } => (visible_len as usize) * (count as usize),
-            Storage::Variable (VariableInfo {
+            Storage::Variable(VariableInfo {
                 ref positions,
                 head_skip,
                 tail_skip,
@@ -397,7 +397,7 @@ impl Storage {
                 let stop = start.saturating_add(visible_len);
                 positions.push((start, stop));
             }
-            *self = Storage::Variable (VariableInfo {
+            *self = Storage::Variable(VariableInfo {
                 positions,
                 head_skip: 0,
                 tail_skip: 0,
@@ -418,7 +418,7 @@ impl Storage {
         self.promote_to_variable();
         //TODO: Think about whether we should turn this into adjusting of front_skip instead
         match self {
-            Storage::Variable (VariableInfo {
+            Storage::Variable(VariableInfo {
                 positions,
                 front_skip,
                 ..
@@ -444,7 +444,7 @@ impl Storage {
         //TODO: optimization if FixedLength & Empty -> just reduce Count.
         self.promote_to_variable();
         match self {
-            Storage::Variable (VariableInfo {
+            Storage::Variable(VariableInfo {
                 positions,
                 front_skip,
                 ..
@@ -503,7 +503,7 @@ impl Storage {
         assert!(start <= stop, "start {start} > stop {stop}");
         self.promote_to_variable();
         match self {
-            Storage::Variable (VariableInfo { positions, .. }) => positions.push((start, stop)),
+            Storage::Variable(VariableInfo { positions, .. }) => positions.push((start, stop)),
             Storage::FixedLength { .. } => {
                 // cov:excl-start
                 unreachable!("just promoted")

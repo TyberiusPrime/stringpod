@@ -22,11 +22,15 @@
 //! their bytes orphaned in the buffer (rebuild via a new pod if reclamation
 //! matters).
 
+mod column;
 mod cross;
 mod dual;
+mod editlog;
+mod lifted;
 mod single;
 mod storage;
 
+pub use column::ColumnEdits;
 pub use cross::{
     CrossPodLocations, CrossPodLocationsBuilder, CrossPodRecords, CrossPods, CrossPodsRecordsMut,
     Location, Pod, PodMut, PodRef, RowCompanions,
@@ -35,4 +39,6 @@ pub use dual::{
     ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,
     DualStringPodBuilder,
 };
+pub use editlog::{EditLog, EditLogError, EditLogView, OffsetLift, RegionLift};
+pub use lifted::Lifted;
 pub use single::{IterMut as StringPodIterMut, StringPod, StringPodAliasBuilder, StringPodBuilder};

@@ -1,0 +1,138 @@
+//! End-to-end liftover through the real `DualStringPod` mutators.
+//!
+//! The pods now record every coordinate edit into a `ColumnEdits` as a side
+//! effect of their normal mutators (via the `Lifted` trait). A tag captures
+//! `generation(row)` and its logical `[start, len)` when it is born, freezes its
+//! bytes with the alias builder, and later lifts through `ops_since(born, row)`.
+//! These tests check that the lifted span in the *live* pod still names the
+//! frozen bytes — i.e. that the wiring records the right edits — across the
+//! uniform pipeline, conditional/per-row edits, row drops, clipping, and a
+//! single-read write-back.
+
+use bstr::BStr;
+use stringpod::{DualStringPod, DualStringPodBuilder, Lifted, RegionLift};
+
+fn lift(pod: &DualStringPod, born: usize, row: usize, start: usize, len: usize, orig: usize) -> RegionLift {
+    pod.ops_since(born, row)
+        .expect("row & generation in range")
+        .map_region(start, len, orig)
+        .expect("region in range")
+}
+
+#[test]
+fn lifts_a_tag_through_a_uniform_pipeline() {
+    let mut bld = DualStringPodBuilder::with_capacity(0, 1);
+    bld.push(b"ACGTACGTACGT", b"IIIIFFFFJJJJ"); // len 12
+    let mut pod = bld.finish();
+
+    // Tag born now: region [4, 8) of read 0 ("ACGT" / "FFFF").
+    let born = pod.generation(0).expect("row 0 exists");
+    assert_eq!(born, 0);
+    let snapshot = {
+        let mut ab = pod.alias_builder();
+        ab.push_alias(4, 4);
+        ab.finish()
+    };
+    assert_eq!(snapshot.seq(0), BStr::new("ACGT"));
+    assert_eq!(snapshot.qual(0), BStr::new("FFFF"));
+    let orig = 12;
+
+    // A whole-segment pipeline: overlay cut, two rebuilds (Arc diverges).
+    pod.cut_start(2, None);
+    pod = pod.prefix(b"XX", b"##");
+    pod = pod.reverse(None);
+
+    match lift(&pod, born, 0, 4, 4, orig) {
+        RegionLift::Kept { start, len } => {
+            let mut rev_seq = b"ACGT".to_vec();
+            rev_seq.reverse();
+            let mut rev_qual = b"FFFF".to_vec();
+            rev_qual.reverse();
+            // One coordinate map serves both buffers.
+            assert_eq!(&pod.seq(0)[start..start + len], BStr::new(&rev_seq));
+            assert_eq!(&pod.qual(0)[start..start + len], BStr::new(&rev_qual));
+        }
+        RegionLift::Dropped => panic!("region should survive the pipeline"),
+    }
+    // The frozen snapshot never moved, and the generation advanced.
+    assert_eq!(snapshot.seq(0), BStr::new("ACGT"));
+    assert!(pod.generation(0).expect("row 0") > born);
+}
+
+fn assert_tag(pod: &DualStringPod, row: usize, expect_start: usize) {
+    match lift(pod, 0, row, 4, 4, 8) {
+        RegionLift::Kept { start, len } => {
+            assert_eq!(start, expect_start, "row {row} lifted start");
+            assert_eq!(&pod.seq(row)[start..start + len], BStr::new("CCCC"));
+        }
+        RegionLift::Dropped => panic!("row {row} tag should survive"),
+    }
+}
+
+#[test]
+fn conditional_edit_then_drain_keeps_rows_aligned() {
+    let mut bld = DualStringPodBuilder::with_capacity(8, 3);
+    for _ in 0..3 {
+        bld.push(b"AAAACCCC", b"IIIIIIII"); // tag region [4, 8) = "CCCC"
+    }
+    let mut pod = bld.finish();
+    assert_eq!(
+        (0..3).map(|r| pod.generation(r)).collect::<Vec<_>>(),
+        vec![Some(0), Some(0), Some(0)],
+    );
+
+    // Conditional cut on rows 0 and 2 only — promotes the edit column per-entry.
+    pod.cut_start(2, Some(&[true, false, true]));
+    assert_eq!(pod.generation(0), Some(1));
+    assert_eq!(pod.generation(1), Some(0)); // untouched row recorded nothing
+    assert_eq!(pod.generation(2), Some(1));
+    assert_tag(&pod, 0, 2); // shifted by the cut
+    assert_tag(&pod, 1, 4); // untouched
+    assert_tag(&pod, 2, 2);
+
+    // Drop the middle (untouched) row; the survivors stay addressable and
+    // their histories stay aligned.
+    pod.drain(1..2);
+    assert_eq!(pod.len(), 2);
+    assert_tag(&pod, 0, 2); // old row 0
+    assert_tag(&pod, 1, 2); // old row 2, now row 1
+}
+
+#[test]
+fn max_len_drops_a_tag_beyond_the_cut() {
+    let mut bld = DualStringPodBuilder::with_capacity(0, 1);
+    bld.push(b"ACGTACGTACGT", b"IIIIFFFFJJJJ"); // len 12
+    let mut pod = bld.finish();
+
+    pod.max_len(6, None); // keep first 6 bytes
+
+    // A tag in the kept prefix survives; one in the clipped tail is dropped.
+    assert_eq!(
+        lift(&pod, 0, 0, 0, 4, 12),
+        RegionLift::Kept { start: 0, len: 4 }
+    );
+    assert_eq!(lift(&pod, 0, 0, 8, 4, 12), RegionLift::Dropped);
+}
+
+#[test]
+fn write_back_splice_is_isolated_to_its_read() {
+    let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+    bld.push(b"ACGTACGT", b"IIIIIIII"); // len 8
+    bld.push(b"ACGTACGT", b"IIIIIIII");
+    let mut pod = bld.finish();
+
+    // Write a longer tag back into read 0: at offset 2, replace 2 bytes with 5.
+    pod.record_splice(0, 2, 2, 5);
+
+    // A downstream tag at [6, 8) on read 0 shifts by +3; read 1 is untouched.
+    assert_eq!(
+        lift(&pod, 0, 0, 6, 2, 8),
+        RegionLift::Kept { start: 9, len: 2 }
+    );
+    assert_eq!(
+        lift(&pod, 0, 1, 6, 2, 8),
+        RegionLift::Kept { start: 6, len: 2 }
+    );
+    assert_eq!(pod.generation(0), Some(1));
+    assert_eq!(pod.generation(1), Some(0));
+}
