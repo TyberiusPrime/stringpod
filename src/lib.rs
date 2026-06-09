@@ -27,6 +27,7 @@ mod cross;
 mod dual;
 mod editlog;
 mod lifted;
+mod multiloc;
 mod single;
 mod storage;
 
@@ -41,4 +42,5 @@ pub use dual::{
 };
 pub use editlog::{EditLog, EditLogError, EditLogView, OffsetLift, RegionLift};
 pub use lifted::Lifted;
+pub use multiloc::{DualStringPodMultiLocation, DualStringPodMultiLocationAliasBuilder};
 pub use single::{IterMut as StringPodIterMut, StringPod, StringPodAliasBuilder, StringPodBuilder};
