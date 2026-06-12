@@ -486,6 +486,74 @@ impl DualStringPod {
         out
     }
 
+    /// Apply a per-entry length-changing write-back (splice). For each entry `i`,
+    /// `edits[i] = Some((at, del, ins_seq, ins_qual))` replaces the `del` bytes at
+    /// offset `at` with `ins_seq` / `ins_qual` (equal length); `None` leaves the
+    /// entry untouched. `at`/`del` are in the entry's *current* frame.
+    ///
+    /// Both buffers are rebuilt (a mid-entry length change can't live in an
+    /// overlay). The edit history is carried across the rebuild and each splice is
+    /// recorded, so any tag whose coordinates were captured earlier lifts through
+    /// the change — the whole point of recording rather than rebuilding blind.
+    ///
+    /// # Panics
+    /// - If `edits.len() != self.len()`.
+    /// - If any `ins_seq.len() != ins_qual.len()`.
+    /// - If any `at + del` exceeds the entry's current length.
+    pub fn splice_entries(&mut self, edits: &[Option<(usize, usize, Vec<u8>, Vec<u8>)>]) {
+        assert_eq!(
+            edits.len(),
+            self.len(),
+            "splice edits length {} must match entry count {}",
+            edits.len(),
+            self.len(),
+        );
+        let n = self.len();
+        let mut bld = DualStringPodBuilder::with_capacity(0, n);
+        let mut seq_buf = Vec::new();
+        let mut qual_buf = Vec::new();
+        for i in 0..n {
+            match &edits[i] {
+                None => bld.push(self.seq(i), self.qual(i)),
+                Some((at, del, ins_seq, ins_qual)) => {
+                    assert_eq!(
+                        ins_seq.len(),
+                        ins_qual.len(),
+                        "splice ins_seq.len() {} != ins_qual.len() {}",
+                        ins_seq.len(),
+                        ins_qual.len(),
+                    );
+                    let (seq, qual) = (self.seq(i), self.qual(i));
+                    let (at, del) = (*at, *del);
+                    assert!(
+                        at + del <= seq.len(),
+                        "splice {at}+{del} exceeds entry {i} length {}",
+                        seq.len(),
+                    );
+                    seq_buf.clear();
+                    seq_buf.extend_from_slice(&seq[..at]);
+                    seq_buf.extend_from_slice(ins_seq);
+                    seq_buf.extend_from_slice(&seq[at + del..]);
+                    qual_buf.clear();
+                    qual_buf.extend_from_slice(&qual[..at]);
+                    qual_buf.extend_from_slice(ins_qual);
+                    qual_buf.extend_from_slice(&qual[at + del..]);
+                    bld.push(&seq_buf, &qual_buf);
+                }
+            }
+        }
+        let mut out = bld.finish();
+        // Carry the edit history across the rebuild, then record each splice so
+        // later liftover sees the length change.
+        out.edits = std::mem::replace(&mut self.edits, ColumnEdits::new(0));
+        for (i, e) in edits.iter().enumerate() {
+            if let Some((at, del, ins_seq, _)) = e {
+                out.record_splice(i, *at, *del, ins_seq.len());
+            }
+        }
+        *self = out;
+    }
+
     /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
     /// pods; rebuilds both buffers for `Variable` pods.
     ///

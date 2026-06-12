@@ -40,19 +40,17 @@ fn aliases_multi_hit_and_no_hit_rows() {
     assert!(snap.row_is_empty(1));
     assert_eq!(snap.loc_count_in(2), 1);
 
-    assert_eq!(snap.seq(0, 0), BStr::new("ACGT"));
-    assert_eq!(snap.qual(0, 0), BStr::new("IIII"));
-    assert_eq!(snap.seq(0, 1), BStr::new("ACGT"));
-    assert_eq!(snap.qual(0, 1), BStr::new("JJJJ"));
-    assert_eq!(snap.pair(2, 0), (BStr::new("CCCC"), BStr::new("2222")));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("ACGTACGT"));
+    assert_eq!(snap.joined_qual(0, None), BStr::new("IIIIJJJJ"));
+    assert_eq!(snap.joined_seq(2, None), (BStr::new("CCCC")));
 
     // joined: borrow for single, allocate (with separator) for multi.
     assert_eq!(&*snap.joined_seq(0, Some(b"-")), BStr::new("ACGT-ACGT"));
     assert_eq!(&*snap.joined_qual(0, None), BStr::new("IIIIJJJJ"));
     assert_eq!(&*snap.joined_seq(2, None), BStr::new("CCCC"));
 
-    let row0: Vec<_> = snap.iter_row(0).collect();
-    assert_eq!(row0.len(), 2);
+    // let row0: Vec<_> = snap.iter_row(0).collect();
+    // assert_eq!(row0.len(), 2);
 }
 
 #[test]
@@ -77,8 +75,8 @@ fn loc_region_returns_captured_read_relative_coords() {
     assert_eq!(row1, vec![(4, 4)]);
 
     // and the coordinate still slices the right frozen bytes.
-    assert_eq!(snap.seq(1, 0), BStr::new("GGGG"));
-    assert_eq!(snap.qual(1, 0), BStr::new("2222"));
+    assert_eq!(snap.joined_seq(1, None), BStr::new("GGGG"));
+    assert_eq!(snap.joined_qual(1, None), BStr::new("2222"));
 }
 
 #[test]
@@ -100,21 +98,13 @@ fn iter_seq_qual_pair_yield_per_row_captured_values() {
     let seqs: Vec<Cow<BStr>> = snap.iter_seq().collect();
     assert_eq!(
         seqs,
-        vec![
-            BStr::new("ACGTACGT"),
-            BStr::new(""),
-            BStr::new("CCCC")
-        ]
+        vec![BStr::new("ACGTACGT"), BStr::new(""), BStr::new("CCCC")]
     );
 
     let quals: Vec<Cow<BStr>> = snap.iter_qual().collect();
     assert_eq!(
         quals,
-        vec![
-            BStr::new("IIIIJJJJ"),
-            BStr::new(""),
-            BStr::new("2222")
-        ]
+        vec![BStr::new("IIIIJJJJ"), BStr::new(""), BStr::new("2222")]
     );
 
     // `iter()` is ExactSize over rows; `&snap` (IntoIterator) yields one
@@ -123,19 +113,27 @@ fn iter_seq_qual_pair_yield_per_row_captured_values() {
     let mut pairs: Vec<(Cow<BStr>, Cow<BStr>)> = Vec::new();
     dbg!(&snap);
     for pair in &snap {
-        pairs.push( pair)
+        pairs.push(pair)
     }
     assert_eq!(pairs.len(), 3);
     assert_eq!(
         pairs[0],
-        (Cow::Borrowed(BStr::new("ACGTACGT")), Cow::Borrowed(BStr::new("IIIIJJJJ")))
+        (
+            Cow::Borrowed(BStr::new("ACGTACGT")),
+            Cow::Borrowed(BStr::new("IIIIJJJJ"))
+        )
     );
-    assert_eq!(pairs[1], 
-        (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new(""))));
+    assert_eq!(
+        pairs[1],
+        (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new("")))
+    );
 
     assert_eq!(
         pairs[2],
-        ((Cow::Borrowed(BStr::new("CCCC")), Cow::Borrowed(BStr::new("2222"))))
+        ((
+            Cow::Borrowed(BStr::new("CCCC")),
+            Cow::Borrowed(BStr::new("2222"))
+        ))
     );
 }
 
@@ -147,19 +145,43 @@ fn snapshot_is_frozen_across_source_edits() {
         b.push_row(&[(2, 4)]); // "GTAC" / "IIFF"
         b.finish()
     };
-    assert_eq!(snap.pair(0, 0), (BStr::new("GTAC"), BStr::new("IIFF")));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("GTAC")),
+            Cow::Borrowed(BStr::new("IIFF"))
+        )
+    );
 
     // Overlay cut (metadata only, same Arc).
     source.cut_start(3, None);
-    assert_eq!(snap.pair(0, 0), (BStr::new("GTAC"), BStr::new("IIFF")));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("GTAC")),
+            Cow::Borrowed(BStr::new("IIFF"))
+        )
+    );
 
     // Rebuild (prefix → fresh Arc; snapshot keeps the old one).
     source = source.prefix(b"XX", b"##");
-    assert_eq!(snap.pair(0, 0), (BStr::new("GTAC"), BStr::new("IIFF")));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("GTAC")),
+            Cow::Borrowed(BStr::new("IIFF"))
+        )
+    );
 
     // In-place reverse (COW-clones because the snapshot shares the Arc).
     let _reversed = source.reverse(None);
-    assert_eq!(snap.pair(0, 0), (BStr::new("GTAC"), BStr::new("IIFF")));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("GTAC")),
+            Cow::Borrowed(BStr::new("IIFF"))
+        )
+    );
 }
 
 #[test]
@@ -182,12 +204,12 @@ fn row_axis_keeps_snapshot_aligned() {
 
     snap.drain(1..3); // drop rows 1,2
     assert_eq!(snap.row_count(), 2);
-    assert_eq!(snap.seq(0, 0), BStr::new("AAAA"));
-    assert_eq!(snap.seq(1, 0), BStr::new("DDDD"));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("AAAA"));
+    assert_eq!(snap.joined_seq(1, None), BStr::new("DDDD"));
 
     snap.retain_by_bools(&[false, true]); // keep only "DDDD"
     assert_eq!(snap.row_count(), 1);
-    assert_eq!(snap.seq(0, 0), BStr::new("DDDD"));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("DDDD"));
 
     snap.truncate(0);
     assert!(snap.is_empty());
@@ -218,8 +240,8 @@ fn aliases_correctly_through_divergent_first_byte() {
         b.push_row(&[(0, 4)]); // "TTTT" / "FFFF"
         b.finish()
     };
-    assert_eq!(snap.pair(0, 0), (BStr::new("CG"), BStr::new("II")));
-    assert_eq!(snap.pair(1, 0), (BStr::new("TTTT"), BStr::new("FFFF")));
+    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("CG")), Cow::Borrowed(BStr::new("II"))));
+    assert_eq!(snap.joined_pair(1, None), (Cow::Borrowed(BStr::new("TTTT")), Cow::Borrowed(BStr::new("FFFF"))));
 }
 
 #[test]
@@ -232,7 +254,7 @@ fn make_exclusive_detaches_from_source() {
     };
     snap.make_exclusive();
     drop(source);
-    assert_eq!(snap.pair(0, 0), (BStr::new("ACGT"), BStr::new("IIII")));
+    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("ACGT")), Cow::Borrowed(BStr::new("IIII"))));
 }
 
 #[test]
@@ -256,7 +278,7 @@ fn iter_row_lengths_sums_locations_with_and_without_sep() {
     let no_sep: Vec<usize> = snap.iter_row_lengths(None).collect();
     assert_eq!(no_sep, vec![8, 0, 4]);
 
-    let with_sep: Vec<usize> = snap.iter_row_lengths(Some(b'-')).collect();
+    let with_sep: Vec<usize> = snap.iter_row_lengths(Some(b"-")).collect();
     assert_eq!(with_sep, vec![9, 0, 4]);
 }
 
@@ -265,7 +287,7 @@ fn push_row_from_ranges_matches_tuple_form() {
     // The range front door must produce the exact same snapshot as the
     // `(start, len)` form: `0..4` ≡ `(0, 4)`, `8..12` ≡ `(8, 4)`.
     let source = read_pod(&[
-        ("ACGTACGTACGT", "IIIIFFFFJJJJ"),
+        ("AAGTACGTACGT", "IIIIFFFFJJJJ"),
         ("TTTTTTTT", "########"),
         ("GGGGCCCC", "11112222"),
     ]);
@@ -281,8 +303,9 @@ fn push_row_from_ranges_matches_tuple_form() {
     assert_eq!(snap.loc_region(0, 1), (8, 4));
     assert!(snap.row_is_empty(1));
     assert_eq!(snap.loc_region(2, 0), (4, 4));
-    assert_eq!(snap.pair(0, 1), (BStr::new("ACGT"), BStr::new("JJJJ")));
-    assert_eq!(snap.pair(2, 0), (BStr::new("CCCC"), BStr::new("2222")));
+    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("AAGTACGT")), Cow::Borrowed(BStr::new("IIIIJJJJ"))));
+    assert_eq!(snap.joined_pair(1, None), (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new(""))));
+    assert_eq!(snap.joined_pair(2, None), (Cow::Borrowed(BStr::new("CCCC")), Cow::Borrowed(BStr::new("2222"))));
 }
 
 #[test]

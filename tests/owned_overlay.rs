@@ -30,7 +30,7 @@ fn owned_and_alias_rows_coexist() {
         b.push_row_from_ranges(&[0..4]);
         // read 1 → owned content "AGTC" with synthesized 'B' quality, anchored at
         // the empty span at the end of the read (grow-from-nothing case).
-        b.push_owned_row((8, 0), b"AGTC", b"BBBB");
+        b.push_owned_row(&[(4, 4)], b"AGTC", b"BBBB");
         // read 2 → no hit.
         b.push_row(&[]);
         b.finish()
@@ -41,22 +41,23 @@ fn owned_and_alias_rows_coexist() {
     // Alias row reads straight out of the source buffers.
     assert_eq!(snap.loc_count_in(0), 1);
     assert!(!snap.row_is_empty(0));
-    assert_eq!(snap.seq(0, 0), BStr::new("AAAA"));
-    assert_eq!(snap.qual(0, 0), BStr::new("IIII"));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("AAAA"));
+    assert_eq!(snap.joined_qual(0, None), BStr::new("IIII"));
     assert_eq!(snap.loc_region(0, 0), (0, 4));
 
     // Owned row reads out of the arena; its region is the anchor span, not the
     // content length (0 here — the content stands in for an empty span).
     assert_eq!(snap.loc_count_in(1), 1);
     assert!(!snap.row_is_empty(1));
-    assert_eq!(snap.seq(1, 0), BStr::new("AGTC"));
-    assert_eq!(snap.qual(1, 0), BStr::new("BBBB"));
-    assert_eq!(snap.loc_region(1, 0), (8, 0));
+    assert_eq!(snap.joined_seq(1, None), BStr::new("AGTC"));
+    assert_eq!(snap.joined_qual(1, None), BStr::new("BBBB"));
+    assert_eq!(snap.loc_region(1, 0), (4, 4));
     assert_eq!(snap.row_length(1, None), 4);
     assert_eq!(snap.joined_seq(1, None).as_ref(), BStr::new("AGTC"));
     assert_eq!(snap.joined_qual(1, None).as_ref(), BStr::new("BBBB"));
     // covered_positions reflects the (empty) anchor, not the content.
-    assert_eq!(snap.covered_positions(1).collect::<Vec<_>>(), Vec::<usize>::new());
+    assert_eq!(snap.covered_positions(0).collect::<Vec<_>>(), vec![0,1,2,3]);
+    assert_eq!(snap.covered_positions(1).collect::<Vec<_>>(), vec![4,5,6,7]);
 
     // No-hit row stays empty.
     assert!(snap.row_is_empty(2));
@@ -71,15 +72,15 @@ fn owned_row_with_real_anchor_and_doubled_content() {
     let snap = {
         let mut b = source.multi_location_alias_builder();
         // matched "GTAC" at 2..6, doubled → "GTACGTAC", quality doubled too.
-        b.push_owned_row((2, 4), b"GTACGTAC", b"23452345");
+        b.push_owned_row(&[(2, 4)], b"GTACGTAC", b"23452345");
         b.finish()
     };
 
-    assert_eq!(snap.seq(0, 0), BStr::new("GTACGTAC"));
-    assert_eq!(snap.qual(0, 0), BStr::new("23452345"));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("GTACGTAC"));
+    assert_eq!(snap.joined_qual(0, None), BStr::new("23452345"));
     assert_eq!(snap.loc_region(0, 0), (2, 4));
     assert_eq!(snap.covered_positions(0).collect::<Vec<_>>(), vec![2, 3, 4, 5]);
-    assert_eq!(snap.row_length(0, None), 8);
+    assert_eq!(snap.row_length(0, None), 4);
 }
 
 #[test]
@@ -87,8 +88,8 @@ fn owned_rows_share_one_arena_and_survive_make_exclusive() {
     let source = read_pod(&[("AAAA", "IIII"), ("CCCC", "JJJJ")]);
     let mut snap = {
         let mut b = source.multi_location_alias_builder();
-        b.push_owned_row((0, 4), b"XX", b"BB");
-        b.push_owned_row((0, 4), b"YYY", b"BBB");
+        b.push_owned_row(&[(0, 4)], b"XX", b"BB");
+        b.push_owned_row(&[(0, 4)], b"YYY", b"BBB");
         b.finish()
     };
     // make_exclusive only detaches the aliased source buffers; owned content is
@@ -96,10 +97,8 @@ fn owned_rows_share_one_arena_and_survive_make_exclusive() {
     // dropped.
     snap.make_exclusive();
     drop(source);
-    assert_eq!(snap.seq(0, 0), BStr::new("XX"));
-    assert_eq!(snap.qual(0, 0), BStr::new("BB"));
-    assert_eq!(snap.seq(1, 0), BStr::new("YYY"));
-    assert_eq!(snap.qual(1, 0), BStr::new("BBB"));
+    assert_eq!(snap.joined_seq(0, None), BStr::new("XX"));
+    assert_eq!(snap.joined_qual(0, None), BStr::new("BB"));
 
     let joined: Vec<BString> = (0..snap.row_count())
         .map(|r| snap.joined_seq(r, None).into_owned())

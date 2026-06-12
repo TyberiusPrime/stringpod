@@ -143,3 +143,36 @@ fn write_back_splice_is_isolated_to_its_read() {
     assert_eq!(pod.generation(0), Some(1));
     assert_eq!(pod.generation(1), Some(0));
 }
+
+#[test]
+fn splice_entries_rewrites_bytes_and_carries_history() {
+    let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+    bld.push(b"AACCGGTT", b"IIIIIIII"); // len 8
+    bld.push(b"AACCGGTT", b"IIIIIIII");
+    let mut pod = bld.finish();
+
+    // A tag born now at [6, 8) ("TT") of read 0, before any edit.
+    let born = pod.generation(0).expect("row 0 exists");
+    assert_eq!(born, 0);
+
+    // An earlier whole-column edit: drop the first 2 bytes. The tag's birth-frame
+    // [6, 8) now lives at [4, 6).
+    pod.cut_start(2, None);
+    assert_eq!(pod.seq(0), BStr::new(b"CCGGTT"));
+    assert_eq!(lift(&pod, born, 0, 6, 2, 8), RegionLift::Kept { start: 4, len: 2 });
+
+    // Splice read 0 only: at current offset 0, replace 2 bytes ("CC") with 3 ("xyz").
+    pod.splice_entries(&[Some((0, 2, b"xyz".to_vec(), b"###".to_vec())), None]);
+
+    // Bytes are rebuilt; read 1 is untouched.
+    assert_eq!(pod.seq(0), BStr::new(b"xyzGGTT"));
+    assert_eq!(pod.qual(0), BStr::new(b"###IIII"));
+    assert_eq!(pod.seq(1), BStr::new(b"CCGGTT"));
+
+    // History survives the rebuild: the tag born at gen 0 lifts through *both* the
+    // cut and the splice. Its [6, 8) sat at [4, 6) pre-splice; the +1 net insert
+    // before it shifts it to [5, 7).
+    assert_eq!(lift(&pod, born, 0, 6, 2, 8), RegionLift::Kept { start: 5, len: 2 });
+    // Read 1 saw only the cut.
+    assert_eq!(lift(&pod, born, 1, 6, 2, 8), RegionLift::Kept { start: 4, len: 2 });
+}

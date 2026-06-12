@@ -28,6 +28,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::Arc;
 
+use crate::Lifted;
 use crate::dual::DualStringPod;
 
 /// One row's locations, stored **read-relative** as `(start, len)` pairs — i.e.
@@ -38,23 +39,51 @@ use crate::dual::DualStringPod;
 /// location rows — the common case — stay on the stack.
 type Locs = SmallVec<[(u32, u32); 1]>;
 
+#[derive(Clone, Debug)]
+struct LocsAndBase {
+    base: u32,
+    locs: Locs,
+}
+
 /// One row of the snapshot. Either an **Alias** — a zero-copy view of the source
 /// read, holding the read-relative `(start, len)` slices captured at build time —
 /// or an **Owned** row whose content diverged from any single read slice (a regex
 /// replacement that conjures or reorders bytes, or an in-place content edit such
 /// as reverse-complement) and now lives in the pod's `owned` arena.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum Row {
     /// Zero-copy view of the source read: `base` offset in shared metadata space
     /// at capture, plus its read-relative locations.
-    Alias { base: u32, locs: Locs },
+    Alias(LocsAndBase),
     /// Divergent content held in the pod's [`owned`](DualStringPodMultiLocation::owned)
-    /// arena: the sequence is `owned[off..off + len]` and the quality is the
+    /// arena: the sequence is `owned[owned_offset..owned_offset + len]` and the quality is the
     /// equal-length run right after it (`owned[off + len..off + 2 * len]`) — so a
-    /// single `(off, len)` locates both. `anchor` is the read-relative
-    /// `(start, len)` span the content replaced: precisely what liftover lifts and
+    /// single `(off, len)` locates both. `anchor` is just the aliased positions
+    /// that the content replaces.
+    /// (precisely what liftover lifts and
     /// what write-back overwrites in the live read (the content length may differ).
-    Owned { anchor: (u32, u32), off: u32, len: u32 },
+    Owned {
+        anchor: LocsAndBase,
+        off: u32,
+        len: u32,
+    },
+}
+
+/// What a row's coordinates were captured against: the source entry's edit-log
+/// generation at build time (`generation`) and its byte length in that frame
+/// (`len`). Together they are everything [`EditLogView::map_region`](crate::EditLogView::map_region)
+/// needs to lift a stored read-relative `(start, len)` forward into the source
+/// pod's *current* frame: `pod.ops_since(generation, row).map_region(start, len, len_at_birth)`.
+/// Stored per row because a column may mix tags born at different generations
+/// (e.g. a later merge) and because a row's birth length differs from its
+/// current length once the source read is edited.
+#[derive(Clone, Copy, Debug)]
+struct RowBorn {
+    /// Source entry's edit-log generation at capture (`0` if no edit preceded it).
+    generation: u32,
+    /// Source entry's visible byte length in the birth frame — the `orig_len`
+    /// the read pod's [`EditLogView`](crate::EditLogView) lifts from.
+    len: u32,
 }
 
 /// A dual (seq + qual) pod whose every row is either a list of byte ranges aliased
@@ -71,6 +100,12 @@ pub struct DualStringPodMultiLocation {
     /// per row) so a 50k-row column is one allocation, not 50k.
     owned: Vec<u8>,
     rows: Vec<Row>,
+    /// Per-row birth frame (parallel to `rows`), so forward liftover knows which
+    /// generation and length to lift each row's coordinates from. Kept aligned
+    /// with `rows` across every row-axis op; untouched by content edits
+    /// ([`set_row_content`](Self::set_row_content)) since a tag's birth doesn't
+    /// move when its bytes are rewritten.
+    born: Vec<RowBorn>,
     /// Opaque, caller-defined identifier for the source this snapshot was
     /// aliased from. `stringpod` never interprets it — it is stamped by the
     /// builder (see
@@ -110,8 +145,7 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn loc_count_in(&self, row: usize) -> usize {
         match &self.rows[row] {
-            Row::Alias { locs, .. } => locs.len(),
-            Row::Owned { .. } => 1,
+            Row::Alias(anchor) | Row::Owned { anchor, .. } => anchor.locs.len(),
         }
     }
 
@@ -123,78 +157,75 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn row_is_empty(&self, row: usize) -> bool {
         match &self.rows[row] {
-            Row::Alias { locs, .. } => locs.is_empty(),
-            Row::Owned { .. } => false,
+            Row::Alias(anchor) | Row::Owned { anchor, .. } => anchor.locs.is_empty(),
         }
     }
 
     /// The length spanned by the regions.
     /// Assumes disjoint regions!
-    pub fn row_length(&self, row: usize, sep: Option<u8>) -> usize {
+    pub fn row_length<'a, 'b>(&'a self, row: usize, sep: Option<&[u8]>) -> usize {
         match &self.rows[row] {
-            Row::Alias { locs, .. } => {
+            Row::Alias(anchor) | Row::Owned { anchor, .. } => {
                 let mut total = 0;
-                for loc in locs {
+                for loc in &anchor.locs {
                     total += loc.1 as usize;
                 }
-                if sep.is_some() {
-                    total += locs.len().saturating_sub(1);
+                if let Some(sep) = sep {
+                    total += anchor.locs.len().saturating_sub(sep.len());
                 }
                 total
-            }
-            // One contiguous owned run: separators never apply.
-            Row::Owned { len, .. } => *len as usize,
+            } // One contiguous owned run: separators never apply.
         }
     }
 
-    /// Sequence bytes of location `loc` in `row`.
-    ///
-    /// # Panics
-    /// If `row` or `loc` is out of range.
-    #[must_use]
-    pub fn seq(&self, row: usize, loc: usize) -> &BStr {
-        match &self.rows[row] {
-            Row::Alias { base, locs } => {
-                let (rel, len) = locs[loc];
-                let start = *base as usize + rel as usize + self.seq_first_byte;
-                BStr::new(&self.seq[start..start + len as usize])
-            }
-            Row::Owned { off, len, .. } => {
-                assert_eq!(loc, 0, "owned row has a single location");
-                let s = *off as usize;
-                BStr::new(&self.owned[s..s + *len as usize])
-            }
-        }
-    }
-
-    /// Quality bytes of location `loc` in `row` (same range as [`seq`](Self::seq)).
-    ///
-    /// # Panics
-    /// If `row` or `loc` is out of range.
-    #[must_use]
-    pub fn qual(&self, row: usize, loc: usize) -> &BStr {
-        match &self.rows[row] {
-            Row::Alias { base, locs } => {
-                let (rel, len) = locs[loc];
-                let start = *base as usize + rel as usize + self.qual_first_byte;
-                BStr::new(&self.qual[start..start + len as usize])
-            }
-            Row::Owned { off, len, .. } => {
-                assert_eq!(loc, 0, "owned row has a single location");
-                let s = *off as usize + *len as usize;
-                BStr::new(&self.owned[s..s + *len as usize])
-            }
-        }
-    }
-
-    /// Both bytes of location `loc` in `row` at once.
-    ///
-    /// # Panics
-    /// If `row` or `loc` is out of range.
-    #[must_use]
-    pub fn pair(&self, row: usize, loc: usize) -> (&BStr, &BStr) {
-        (self.seq(row, loc), self.qual(row, loc))
-    }
+    // /// Sequence bytes of location `loc` in `row`.
+    // ///
+    // /// # Panics
+    // /// If `row` or `loc` is out of range.
+    // #[must_use]
+    // pub fn seq(&self, row: usize, loc: usize) -> &BStr {
+    //     match &self.rows[row] {
+    //         Row::Alias ( anchor) => {
+    //             let (rel, len) = anchor.locs[loc];
+    //             let start = anchor.base as usize + rel as usize + self.seq_first_byte;
+    //             BStr::new(&self.seq[start..start + len as usize])
+    //         }
+    //         Row::Owned { off, len, .. } => {
+    //             assert_eq!(loc, 0, "owned row has a single location");
+    //             let s = *off as usize;
+    //             BStr::new(&self.owned[s..s + *len as usize])
+    //         }
+    //     }
+    // }
+    //
+    // /// Quality bytes of location `loc` in `row` (same range as [`seq`](Self::seq)).
+    // ///
+    // /// # Panics
+    // /// If `row` or `loc` is out of range.
+    // #[must_use]
+    // pub fn qual(&self, row: usize, loc: usize) -> &BStr {
+    //     match &self.rows[row] {
+    //         Row::Alias { base, locs } => {
+    //             let (rel, len) = locs[loc];
+    //             let start = *base as usize + rel as usize + self.qual_first_byte;
+    //             BStr::new(&self.qual[start..start + len as usize])
+    //         }
+    //         Row::Owned { off, len, .. } => {
+    //             assert_eq!(loc, 0, "owned row has a single location");
+    //             let s = *off as usize + *len as usize;
+    //             BStr::new(&self.owned[s..s + *len as usize])
+    //         }
+    //     }
+    // }
+    //
+    // /// Both bytes of location `loc` in `row` at once.
+    // ///
+    // /// # Panics
+    // /// If `row` or `loc` is out of range.
+    // #[must_use]
+    // pub fn pair(&self, row: usize, loc: usize) -> (&BStr, &BStr) {
+    //     (self.seq(row, loc), self.qual(row, loc))
+    // }
 
     /// The read-relative `(start, len)` of location `loc` in `row`, as captured
     /// from the source read at build time. This is precisely the coordinate to
@@ -207,23 +238,37 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn loc_region(&self, row: usize, loc: usize) -> (usize, usize) {
         match &self.rows[row] {
-            Row::Alias { locs, .. } => {
-                let (rel, len) = locs[loc];
+            Row::Alias(anchor) => {
+                let (rel, len) = anchor.locs[loc];
                 (rel as usize, len as usize)
             }
             Row::Owned { anchor, .. } => {
-                assert_eq!(loc, 0, "owned row has a single location");
-                (anchor.0 as usize, anchor.1 as usize)
+                let (rel, len) = anchor.locs[loc];
+                (rel as usize, len as usize)
             }
         }
     }
 
-    /// Iterate the `(seq, qual)` pairs of every location in `row`.
+    // /// Iterate the `(seq, qual)` pairs of every location in `row`.
+    // ///
+    // /// # Panics
+    // /// If `row >= self.row_count()`.
+    // pub fn iter_row(&self, row: usize) -> impl Iterator<Item = (&BStr, &BStr)> {
+    //     (0..self.loc_count_in(row)).map(move |loc| self.pair(row, loc))
+    // }
+
+    /// The `row`'s **birth frame**: the source entry's edit-log `generation` and
+    /// byte `len` captured when this column was built. Feed these to the source
+    /// pod's forward liftover to map a stored read-relative `(start, len)` (from
+    /// [`row_regions`](Self::row_regions)) into the source's current frame:
+    /// `pod.ops_since(generation, row).map_region(start, len, born_len)`.
     ///
     /// # Panics
     /// If `row >= self.row_count()`.
-    pub fn iter_row(&self, row: usize) -> impl Iterator<Item = (&BStr, &BStr)> {
-        (0..self.loc_count_in(row)).map(move |loc| self.pair(row, loc))
+    #[must_use]
+    pub fn row_born(&self, row: usize) -> (usize, usize) {
+        let b = self.born[row];
+        (b.generation as usize, b.len as usize)
     }
 
     /// Iterate the read-relative `(start, len)` of every location in `row`.
@@ -269,13 +314,14 @@ impl DualStringPodMultiLocation {
 
     /// The `row`'s sequence locations joined (optionally with `sep` between
     /// them). Borrows for a single-location row; allocates otherwise.
+    /// For owned rows, returns the owned data instead
     ///
     /// # Panics
     /// If `row >= self.row_count()`.
     #[must_use]
     pub fn joined_seq(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         match &self.rows[row] {
-            Row::Alias { base, locs } => join(&self.seq, self.seq_first_byte, *base, locs, sep),
+            Row::Alias (anchor) => join(&self.seq, self.seq_first_byte, anchor.base, &anchor.locs, sep),
             Row::Owned { off, len, .. } => {
                 let s = *off as usize;
                 Cow::Borrowed(BStr::new(&self.owned[s..s + *len as usize]))
@@ -285,24 +331,36 @@ impl DualStringPodMultiLocation {
 
     /// The `row`'s quality locations joined (optionally with `sep` between
     /// them). Borrows for a single-location row; allocates otherwise.
+    /// For owned rows, return the owned data instead
     ///
     /// # Panics
     /// If `row >= self.row_count()`.
     #[must_use]
     pub fn joined_qual(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         match &self.rows[row] {
-            Row::Alias { base, locs } => join(&self.qual, self.qual_first_byte, *base, locs, sep),
+            Row::Alias (anchor) => join(&self.qual, self.qual_first_byte, anchor.base, &anchor.locs, sep),
             Row::Owned { off, len, .. } => {
-                let s = *off as usize + *len as usize;
+                let s = *off as usize + *len as usize; //seq comes first, then qual
                 Cow::Borrowed(BStr::new(&self.owned[s..s + *len as usize]))
             }
         }
     }
 
+    #[must_use]
+    pub fn joined_pair(&self, row: usize,sep: Option<& [u8]>) -> (
+    Cow<'_, BStr>,
+    Cow<'_, BStr>,
+){
+        (self.joined_seq(row, sep), 
+            self.joined_qual(row,sep)
+        )
+    }
+
+
     /// Iterate the length of every row (sum of location lengths, plus
     /// `sep.is_some() as usize * (locs - 1)` separators). Mirrors the
     /// per-row computation of [`row_length`](Self::row_length).
-    pub fn iter_row_lengths(&self, sep: Option<u8>) -> impl Iterator<Item = usize> + '_ {
+    pub fn iter_row_lengths<'a, 'b> (&'a self, sep: Option<&'a[u8]>) -> impl Iterator<Item = usize> + 'a {
         (0..self.rows.len()).map(move |row| self.row_length(row, sep))
     }
 
@@ -359,6 +417,7 @@ impl DualStringPodMultiLocation {
     /// # Panics
     /// If the range is out of bounds.
     pub fn drain(&mut self, range: Range<usize>) {
+        self.born.drain(range.clone());
         self.rows.drain(range);
     }
 
@@ -369,17 +428,28 @@ impl DualStringPodMultiLocation {
     where
         F: FnMut() -> bool,
     {
-        self.rows.retain(|_| f());
+        // Materialise the keep-mask once so `rows` and the parallel `born` are
+        // filtered identically (the closure must only be called per row once).
+        let keep: Vec<bool> = (0..self.rows.len()).map(|_| f()).collect();
+        let mut it = keep.iter();
+        self.rows
+            .retain(|_| *it.next().expect("mask length matches rows"));
+        let mut it = keep.iter();
+        self.born
+            .retain(|_| *it.next().expect("mask length matches born"));
     }
 
     /// Drop the first `n` rows (mirrors `pop_front`).
     pub fn pop_front(&mut self, n: usize) {
-        self.rows.drain(0..n.min(self.rows.len()));
+        let n = n.min(self.rows.len());
+        self.born.drain(0..n);
+        self.rows.drain(0..n);
     }
 
     /// Keep only the first `len` rows.
     pub fn truncate(&mut self, len: usize) {
         self.rows.truncate(len);
+        self.born.truncate(len);
     }
 
     /// Keep only rows whose bool is `true` (parallel to the rows).
@@ -395,6 +465,9 @@ impl DualStringPodMultiLocation {
         let mut it = keep.iter();
         self.rows
             .retain(|_| *it.next().expect("mask length checked"));
+        let mut it = keep.iter();
+        self.born
+            .retain(|_| *it.next().expect("mask length checked"));
     }
 
     /// Ensure this pod owns both byte buffers outright, cloning each (COW) only
@@ -405,37 +478,37 @@ impl DualStringPodMultiLocation {
     }
 
     /// The read-relative span a `row` occupies / stands in for — the natural
-    /// write-back anchor. For an [`Owned`](Row::Owned) row this is its stored
-    /// anchor; for an alias row it is the span covering all its locations
+    /// write-back anchor.
+    ///
     /// (`min(start) .. max(start+len)`); for a no-hit row, `(0, 0)`.
     #[must_use]
     pub fn row_span(&self, row: usize) -> (usize, usize) {
         match &self.rows[row] {
-            Row::Owned { anchor, .. } => (anchor.0 as usize, anchor.1 as usize),
-            Row::Alias { locs, .. } => {
-                if locs.is_empty() {
+            Row::Owned { anchor, .. } |
+            Row::Alias ( anchor) => {
+                if anchor.locs.is_empty() {
                     return (0, 0);
                 }
-                let start = locs.iter().map(|&(s, _)| s).min().expect("non-empty");
-                let end = locs.iter().map(|&(s, l)| s + l).max().expect("non-empty");
+                let start = anchor.locs.iter().map(|&(s, _)| s).min().expect("non-empty");
+                let end = anchor.locs.iter().map(|&(s, l)| s + l).max().expect("non-empty");
                 (start as usize, (end - start) as usize)
             }
         }
     }
 
-    /// If `row` holds owned (divergent) content, the read-relative `(start, len)`
-    /// span a write-back should overwrite in the live read. `None` for alias rows
-    /// (their content already *is* the read's own bytes — nothing to write back)
-    /// and for no-hit rows. The bytes to write are [`joined_seq`](Self::joined_seq)
-    /// / [`joined_qual`](Self::joined_qual); the content length may differ from the
-    /// span's, so the read grows or shrinks.
-    #[must_use]
-    pub fn owned_writeback_span(&self, row: usize) -> Option<(usize, usize)> {
-        match &self.rows[row] {
-            Row::Owned { anchor, .. } => Some((anchor.0 as usize, anchor.1 as usize)),
-            Row::Alias { .. } => None,
-        }
-    }
+    // /// If `row` holds owned (divergent) content, the read-relative `(start, len)`
+    // /// span a write-back should overwrite in the live read. `None` for alias rows
+    // /// (their content already *is* the read's own bytes — nothing to write back)
+    // /// and for no-hit rows. The bytes to write are [`joined_seq`](Self::joined_seq)
+    // /// / [`joined_qual`](Self::joined_qual); the content length may differ from the
+    // /// span's, so the read grows or shrinks.
+    // #[must_use]
+    // pub fn owned_writeback_span(&self, row: usize) -> Option<(usize, usize)> {
+    //     match &self.rows[row] {
+    //         Row::Owned { anchor, .. } => Some((anchor.0 as usize, anchor.1 as usize)),
+    //         Row::Alias { .. } => None,
+    //     }
+    // }
 
     /// Replace `row`'s content with owned `seq` + `qual` bytes, COW-detaching it
     /// from the source read (the read is *not* touched). Used by content edits on
@@ -449,7 +522,7 @@ impl DualStringPodMultiLocation {
     /// - If `row >= self.row_count()`.
     /// - If `seq.len() != qual.len()`.
     /// - If the arena offset or content length would exceed `u32::MAX`.
-    pub fn set_row_content(&mut self, row: usize, anchor: (u32, u32), seq: &[u8], qual: &[u8]) {
+    pub fn set_row_content(&mut self, row: usize, seq: &[u8], qual: &[u8]) {
         assert!(row < self.rows.len(), "row {row} out of range");
         assert_eq!(
             seq.len(),
@@ -458,11 +531,15 @@ impl DualStringPodMultiLocation {
             seq.len(),
             qual.len(),
         );
+        let anchor = match &self.rows[row] {
+            Row::Alias (anchor) |
+            Row::Owned { anchor, ..}  => anchor
+        };
         let off = u32::try_from(self.owned.len()).expect("owned arena offset exceeds u32");
         let len = u32::try_from(seq.len()).expect("owned content len exceeds u32");
         self.owned.extend_from_slice(seq);
         self.owned.extend_from_slice(qual);
-        self.rows[row] = Row::Owned { anchor, off, len };
+        self.rows[row] = Row::Owned { anchor: anchor.clone(), off, len };
     }
 }
 
@@ -494,11 +571,10 @@ impl<'a> Iterator for PairIter<'a> {
         }
         let row = self.row;
         self.row += 1;
-        let pair = 
-            (
-                self.pod.joined_seq(row, None),
-                self.pod.joined_qual(row, None),
-            );
+        let pair = (
+            self.pod.joined_seq(row, None),
+            self.pod.joined_qual(row, None),
+        );
         Some(pair)
     }
 
@@ -521,7 +597,13 @@ impl<'a> IntoIterator for &'a DualStringPodMultiLocation {
 
 /// Join an alias row's read-relative `locs` out of `buf` (offset by the row's
 /// `base` plus the buffer's `first` byte), borrowing the single-location case.
-fn join<'a>(buf: &'a [u8], first: usize, base: u32, locs: &Locs, sep: Option<&[u8]>) -> Cow<'a, BStr> {
+fn join<'a>(
+    buf: &'a [u8],
+    first: usize,
+    base: u32,
+    locs: &Locs,
+    sep: Option<&[u8]>,
+) -> Cow<'a, BStr> {
     let off = base as usize + first;
     match locs.as_slice() {
         [] => Cow::Borrowed(BStr::new(b"")),
@@ -556,6 +638,7 @@ impl DualStringPod {
             next: 0,
             owned: Vec::new(),
             rows: Vec::new(),
+            born: Vec::new(),
             source_id: 0,
         }
     }
@@ -568,6 +651,7 @@ pub struct DualStringPodMultiLocationAliasBuilder<'a> {
     next: usize,
     owned: Vec<u8>,
     rows: Vec<Row>,
+    born: Vec<RowBorn>,
     source_id: u32,
 }
 
@@ -604,7 +688,8 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
             let len = u32::try_from(len).expect("alias len exceeds u32");
             locs.push((rel_start, len));
         }
-        self.rows.push(Row::Alias { base, locs });
+        self.born.push(self.born_of(entry_len));
+        self.rows.push(Row::Alias ( LocsAndBase {base, locs }));
         self.next += 1;
     }
 
@@ -621,7 +706,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
     /// - If `seq.len() != qual.len()`.
     /// - If `anchor.0 + anchor.1` exceeds the source entry's length.
     /// - If the arena offset, `anchor`, or content length would exceed `u32::MAX`.
-    pub fn push_owned_row(&mut self, anchor: (u32, u32), seq: &[u8], qual: &[u8]) {
+    pub fn push_owned_row(&mut self, locations: &[(u32, u32)], seq: &[u8], qual: &[u8]) {
         assert!(
             self.next < self.source.len(),
             "multi-location alias builder: all {} source entries already consumed",
@@ -638,22 +723,45 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
         let entry_len: u32 = (r.end - r.start)
             .try_into()
             .expect("region longer than u32");
-        let anchor_end = anchor
-            .0
-            .checked_add(anchor.1)
-            .expect("anchor start + len overflows u32");
-        assert!(
-            anchor_end <= entry_len,
-            "owned anchor {}+{}={anchor_end} exceeds entry length {entry_len}",
-            anchor.0,
-            anchor.1,
-        );
+        let base = u32::try_from(r.start).expect("alias base exceeds u32");
+        let mut locs: Locs = SmallVec::with_capacity(locations.len());
+        for &(offset, len) in locations {
+            let end = offset
+                .checked_add(len)
+                .expect("alias offset + len overflows u32");
+            assert!(
+                end <= entry_len,
+                "alias offset {offset}+len {len}={end} exceeds entry length {entry_len}",
+            );
+            let rel_start = u32::try_from(offset).expect("alias offset exceeds u32");
+            let len = u32::try_from(len).expect("alias len exceeds u32");
+            locs.push((rel_start, len));
+        }
+        let anchor = LocsAndBase{base, locs};
         let off = u32::try_from(self.owned.len()).expect("owned arena offset exceeds u32");
         let len = u32::try_from(seq.len()).expect("owned content len exceeds u32");
         self.owned.extend_from_slice(seq);
         self.owned.extend_from_slice(qual);
+        self.born.push(self.born_of(entry_len));
         self.rows.push(Row::Owned { anchor, off, len });
         self.next += 1;
+    }
+
+    /// Capture the current source entry's birth frame: its edit-log generation
+    /// and the `entry_len` already computed by the caller (the entry's visible
+    /// length in that frame). Called once per pushed row, before `self.next`
+    /// advances.
+    fn born_of(&self, entry_len: u32) -> RowBorn {
+        let generation = u32::try_from(
+            self.source
+                .generation(self.next)
+                .expect("entry in range while building"),
+        )
+        .expect("generation exceeds u32");
+        RowBorn {
+            generation,
+            len: entry_len,
+        }
     }
 
     /// Like [`push_row`](Self::push_row), but takes each location as a half-open
@@ -709,6 +817,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
             qual_first_byte: self.source.qual_first_byte,
             owned: self.owned,
             rows: self.rows,
+            born: self.born,
             source_id: self.source_id,
         }
     }
