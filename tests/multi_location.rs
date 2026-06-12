@@ -6,7 +6,7 @@
 //! how the source is later edited (overlay cut, rebuild, in-place reverse); and
 //! row-axis ops keep the snapshot aligned with the reads.
 
-use bstr::{BStr, BString};
+use bstr::BStr;
 use std::borrow::Cow;
 use stringpod::{DualStringPod, DualStringPodBuilder, StringPod, StringPodBuilder};
 
@@ -36,9 +36,9 @@ fn aliases_multi_hit_and_no_hit_rows() {
     };
 
     assert_eq!(snap.row_count(), 3);
-    assert_eq!(snap.locs_in(0), 2);
+    assert_eq!(snap.loc_count_in(0), 2);
     assert!(snap.row_is_empty(1));
-    assert_eq!(snap.locs_in(2), 1);
+    assert_eq!(snap.loc_count_in(2), 1);
 
     assert_eq!(snap.seq(0, 0), BStr::new("ACGT"));
     assert_eq!(snap.qual(0, 0), BStr::new("IIII"));
@@ -97,41 +97,45 @@ fn iter_seq_qual_pair_yield_per_row_captured_values() {
     };
 
     // no-hit row 1 → `None`; hit rows → `Some(joined)`.
-    let seqs: Vec<Option<BString>> = snap.iter_seq().map(|o| o.map(Cow::into_owned)).collect();
+    let seqs: Vec<Cow<BStr>> = snap.iter_seq().collect();
     assert_eq!(
         seqs,
         vec![
-            Some(BString::from("ACGTACGT")),
-            None,
-            Some(BString::from("CCCC"))
+            BStr::new("ACGTACGT"),
+            BStr::new(""),
+            BStr::new("CCCC")
         ]
     );
 
-    let quals: Vec<Option<BString>> = snap.iter_qual().map(|o| o.map(Cow::into_owned)).collect();
+    let quals: Vec<Cow<BStr>> = snap.iter_qual().collect();
     assert_eq!(
         quals,
         vec![
-            Some(BString::from("IIIIJJJJ")),
-            None,
-            Some(BString::from("2222"))
+            BStr::new("IIIIJJJJ"),
+            BStr::new(""),
+            BStr::new("2222")
         ]
     );
 
     // `iter()` is ExactSize over rows; `&snap` (IntoIterator) yields one
     // `Option<(seq, qual)>` per row — `None` for the no-hit row.
     assert_eq!(snap.iter().len(), 3);
-    let mut pairs: Vec<Option<(BString, BString)>> = Vec::new();
+    let mut pairs: Vec<(Cow<BStr>, Cow<BStr>)> = Vec::new();
+    dbg!(&snap);
     for pair in &snap {
-        pairs.push(pair.map(|(s, q)| (s.into_owned(), q.into_owned())));
+        pairs.push( pair)
     }
+    assert_eq!(pairs.len(), 3);
     assert_eq!(
         pairs[0],
-        Some((BString::from("ACGTACGT"), BString::from("IIIIJJJJ")))
+        (Cow::Borrowed(BStr::new("ACGTACGT")), Cow::Borrowed(BStr::new("IIIIJJJJ")))
     );
-    assert_eq!(pairs[1], None);
+    assert_eq!(pairs[1], 
+        (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new(""))));
+
     assert_eq!(
         pairs[2],
-        Some((BString::from("CCCC"), BString::from("2222")))
+        ((Cow::Borrowed(BStr::new("CCCC")), Cow::Borrowed(BStr::new("2222"))))
     );
 }
 
@@ -229,6 +233,64 @@ fn make_exclusive_detaches_from_source() {
     snap.make_exclusive();
     drop(source);
     assert_eq!(snap.pair(0, 0), (BStr::new("ACGT"), BStr::new("IIII")));
+}
+
+#[test]
+fn iter_row_lengths_sums_locations_with_and_without_sep() {
+    // row 0: two hits of len 4 each → 8 without sep, 9 with sep
+    // row 1: no hit                 → 0 in both cases
+    // row 2: one hit of len 4       → 4 in both cases
+    let source = read_pod(&[
+        ("ACGTACGTACGT", "IIIIFFFFJJJJ"),
+        ("TTTTTTTT", "########"),
+        ("GGGGCCCC", "11112222"),
+    ]);
+    let snap = {
+        let mut b = source.multi_location_alias_builder();
+        b.push_row(&[(0, 4), (8, 4)]);
+        b.push_row(&[]);
+        b.push_row(&[(4, 4)]);
+        b.finish()
+    };
+
+    let no_sep: Vec<usize> = snap.iter_row_lengths(None).collect();
+    assert_eq!(no_sep, vec![8, 0, 4]);
+
+    let with_sep: Vec<usize> = snap.iter_row_lengths(Some(b'-')).collect();
+    assert_eq!(with_sep, vec![9, 0, 4]);
+}
+
+#[test]
+fn push_row_from_ranges_matches_tuple_form() {
+    // The range front door must produce the exact same snapshot as the
+    // `(start, len)` form: `0..4` ≡ `(0, 4)`, `8..12` ≡ `(8, 4)`.
+    let source = read_pod(&[
+        ("ACGTACGTACGT", "IIIIFFFFJJJJ"),
+        ("TTTTTTTT", "########"),
+        ("GGGGCCCC", "11112222"),
+    ]);
+    let snap = {
+        let mut b = source.multi_location_alias_builder();
+        b.push_row_from_ranges(&[0..4, 8..12]);
+        b.push_row_from_ranges(&[]); // no hit
+        b.push_row_from_ranges(&[4..8]);
+        b.finish()
+    };
+
+    assert_eq!(snap.loc_region(0, 0), (0, 4));
+    assert_eq!(snap.loc_region(0, 1), (8, 4));
+    assert!(snap.row_is_empty(1));
+    assert_eq!(snap.loc_region(2, 0), (4, 4));
+    assert_eq!(snap.pair(0, 1), (BStr::new("ACGT"), BStr::new("JJJJ")));
+    assert_eq!(snap.pair(2, 0), (BStr::new("CCCC"), BStr::new("2222")));
+}
+
+#[test]
+#[should_panic(expected = "reversed range")]
+fn push_row_from_ranges_rejects_reversed_range() {
+    let source = read_pod(&[("ACGT", "IIII")]);
+    let mut b = source.multi_location_alias_builder();
+    b.push_row_from_ranges(&[3..1]);
 }
 
 #[test]
