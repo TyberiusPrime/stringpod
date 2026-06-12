@@ -200,13 +200,32 @@ impl DualStringPod {
         })
     }
 
-    /// Ensure this pod owns both byte buffers outright, cloning each (COW) only
-    /// if it is currently shared with another pod. After this call, mutating
-    /// accessors such as [`seq_mut`](Self::seq_mut) always succeed.
-    pub fn make_exclusive(&mut self) {
+    /// Ensure this pod owns its **seq** buffer outright, cloning it (COW) only
+    /// if it is currently shared with another pod. After this call, seq-mutating
+    /// access such as [`seq_mut`](Self::seq_mut) / [`iter_seq_mut`](Self::iter_seq_mut)
+    /// always succeeds. Leaves the qual buffer untouched (still shareable).
+    pub fn make_seq_exclusive(&mut self) {
         // `Arc::make_mut` clones a buffer iff its strong count is > 1.
         let _ = Arc::make_mut(&mut self.seq);
+    }
+
+    /// Ensure this pod owns its **qual** buffer outright, cloning it (COW) only
+    /// if it is currently shared with another pod. After this call, qual-mutating
+    /// access such as [`qual_mut`](Self::qual_mut) / [`iter_qual_mut`](Self::iter_qual_mut)
+    /// always succeeds. Leaves the seq buffer untouched (still shareable).
+    pub fn make_qual_exclusive(&mut self) {
         let _ = Arc::make_mut(&mut self.qual);
+    }
+
+    /// Ensure this pod owns both byte buffers outright, cloning each (COW) only
+    /// if it is currently shared with another pod. After this call, mutating
+    /// accessors such as [`seq_mut`](Self::seq_mut) / [`iter_mut`](Self::iter_mut)
+    /// always succeed. Equivalent to calling both
+    /// [`make_seq_exclusive`](Self::make_seq_exclusive) and
+    /// [`make_qual_exclusive`](Self::make_qual_exclusive).
+    pub fn make_exclusive(&mut self) {
+        self.make_seq_exclusive();
+        self.make_qual_exclusive();
     }
 
     #[must_use]
@@ -583,30 +602,74 @@ impl DualStringPod {
         self
     }
 
-    /// Returns a mutable iterator over seq+qual entry pairs, or `None` if
-    /// either byte buffer is shared (Arc strong count > 1).
-    pub fn try_iter_mut(&mut self) -> Option<DualIterMut<'_>> {
+    /// Mutable iterator over seq+qual entry pairs. Always succeeds: it COWs
+    /// either shared buffer first (the [`make_exclusive`](Self::make_exclusive)
+    /// step), so sharing with another pod no longer blocks iteration. Also
+    /// reachable as `(&mut pod).into_iter()`.
+    #[must_use]
+    pub fn iter_mut(&mut self) -> DualIterMut<'_> {
         let back = self.storage.len();
         let seq_first_byte = self.seq_first_byte;
         let qual_first_byte = self.qual_first_byte;
         // Three disjoint fields: seq + qual mutably, storage immutably. Skip
         // each buffer's first-byte prefix so both `remaining` slices start at
         // the same *relative* offset (storage's coordinate system), letting one
-        // shared `consumed` drive both peels.
-        let (_, seq_remaining) = Arc::get_mut(&mut self.seq)?
+        // shared `consumed` drive both peels. `Arc::make_mut` is the COW: it
+        // clones iff the buffer is shared, then hands back a unique `&mut`.
+        let (_, seq_remaining) = Arc::make_mut(&mut self.seq)
             .as_mut_slice()
             .split_at_mut(seq_first_byte);
-        let (_, qual_remaining) = Arc::get_mut(&mut self.qual)?
+        let (_, qual_remaining) = Arc::make_mut(&mut self.qual)
             .as_mut_slice()
             .split_at_mut(qual_first_byte);
-        Some(DualIterMut {
+        DualIterMut {
             seq_remaining,
             qual_remaining,
             storage: &self.storage,
             front: 0,
             back,
             consumed: 0,
-        })
+        }
+    }
+
+    /// Mutable iterator over just the **seq** entries, yielding `&mut BStr` per
+    /// entry. Always succeeds: COWs only the seq buffer first (the
+    /// [`make_seq_exclusive`](Self::make_seq_exclusive) step), leaving qual
+    /// shareable.
+    #[must_use]
+    pub fn iter_seq_mut(&mut self) -> ColIterMut<'_> {
+        let back = self.storage.len();
+        let first = self.seq_first_byte;
+        let (_, remaining) = Arc::make_mut(&mut self.seq)
+            .as_mut_slice()
+            .split_at_mut(first);
+        ColIterMut {
+            remaining,
+            storage: &self.storage,
+            front: 0,
+            back,
+            consumed: 0,
+        }
+    }
+
+    /// Mutable iterator over just the **qual** entries, yielding `&mut BStr` per
+    /// entry. Always succeeds: COWs only the qual buffer first (the
+    /// [`make_qual_exclusive`](Self::make_qual_exclusive) step), leaving seq
+    /// shareable.
+    #[must_use]
+    pub fn iter_qual_mut(&mut self) -> ColIterMut<'_> {
+        let back = self.storage.len();
+        let first = self.qual_first_byte;
+        let (_, remaining) = Arc::make_mut(&mut self.qual)
+            .as_mut_slice()
+            .split_at_mut(first);
+        ColIterMut {
+            remaining,
+            storage: &self.storage,
+            front: 0,
+            back,
+            consumed: 0,
+        }
     }
 
     /// Start an alias builder sharing both byte buffers.
@@ -639,6 +702,14 @@ impl<'a> IntoIterator for &'a DualStringPod {
     type IntoIter = Iter<'a>;
     fn into_iter(self) -> Iter<'a> {
         self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut DualStringPod {
+    type Item = DualEntryMut<'a>;
+    type IntoIter = DualIterMut<'a>;
+    fn into_iter(self) -> DualIterMut<'a> {
+        self.iter_mut()
     }
 }
 
@@ -821,6 +892,71 @@ impl DoubleEndedIterator for DualIterMut<'_> {
 }
 
 impl ExactSizeIterator for DualIterMut<'_> {}
+
+/// Mutable iterator over a single column's entries (`&mut BStr` apiece). Backs
+/// [`DualStringPod::iter_seq_mut`] and [`iter_qual_mut`](DualStringPod::iter_qual_mut);
+/// it peels entries off the held buffer slice with [`split_at_mut`](slice::split_at_mut)
+/// — no `unsafe`. The `remaining` slice starts past the column's first-byte
+/// prefix, so `consumed` runs in storage's relative coordinate system.
+pub struct ColIterMut<'a> {
+    remaining: &'a mut [u8],
+    storage: &'a Storage,
+    front: usize,
+    back: usize,
+    /// Relative offset (storage coordinates) of `remaining[0]`; advances as the
+    /// front is peeled.
+    consumed: usize,
+}
+
+impl<'a> Iterator for ColIterMut<'a> {
+    type Item = &'a mut BStr;
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        let r = self.storage.entry_range(self.front);
+        self.front += 1;
+        debug_assert!(
+            r.start >= self.consumed,
+            "ColIterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let rem = std::mem::take(&mut self.remaining);
+        let (_gap, rest) = rem.split_at_mut(r.start - self.consumed);
+        let (entry, tail) = rest.split_at_mut(r.end - r.start);
+        self.remaining = tail;
+        self.consumed = r.end;
+        Some(entry.as_bstr_mut())
+    }
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let r = self.back - self.front;
+        (r, Some(r))
+    }
+}
+
+impl DoubleEndedIterator for ColIterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        if self.front >= self.back {
+            return None;
+        }
+        self.back -= 1;
+        let r = self.storage.entry_range(self.back);
+        debug_assert!(
+            r.start >= self.consumed,
+            "ColIterMut: entries must be ascending and non-overlapping (entry start {} < consumed {})",
+            r.start,
+            self.consumed,
+        );
+        let rem = std::mem::take(&mut self.remaining);
+        let (left, right) = rem.split_at_mut(r.start - self.consumed);
+        let (entry, _after) = right.split_at_mut(r.end - r.start);
+        self.remaining = left;
+        Some(entry.as_bstr_mut())
+    }
+}
+
+impl ExactSizeIterator for ColIterMut<'_> {}
 
 // ── owning builder ───────────────────────────────────────────────────────
 
@@ -1577,7 +1713,7 @@ mod tests {
         assert_eq!(p.qual(1), BStr::new("JJ")); // palindrome
     }
 
-    // ── try_iter_mut ──────────────────────────────────────────────────────────
+    // ── iter_mut ──────────────────────────────────────────────────────────────
 
     #[test]
     fn dual_iter_mut_allows_in_place_mutation() {
@@ -1585,7 +1721,7 @@ mod tests {
         bld.push(b("ACGT"), b("IIII"));
         bld.push(b("TTTT"), b("####"));
         let mut p = bld.finish();
-        for entry in p.try_iter_mut().unwrap() {
+        for entry in p.iter_mut() {
             entry.seq.reverse();
             entry.qual.reverse();
         }
@@ -1596,12 +1732,81 @@ mod tests {
     }
 
     #[test]
-    fn dual_iter_mut_returns_none_when_shared() {
+    fn dual_iter_mut_cows_when_shared() {
+        // A shared buffer no longer blocks iteration: `iter_mut` calls
+        // `make_exclusive`, COW-cloning so the mutation lands on this pod alone
+        // and the clone is left untouched.
         let mut bld = DualStringPodBuilder::with_capacity(2, 1);
         bld.push(b("AB"), b("12"));
         let mut p = bld.finish();
-        let _q = p.clone();
-        assert!(p.try_iter_mut().is_none());
+        let q = p.clone();
+        for e in p.iter_mut() {
+            e.seq.make_ascii_lowercase();
+            e.qual.reverse();
+        }
+        assert_eq!(p.seq(0), BStr::new("ab"));
+        assert_eq!(p.qual(0), BStr::new("21"));
+        // The clone still sees the originals.
+        assert_eq!(q.seq(0), BStr::new("AB"));
+        assert_eq!(q.qual(0), BStr::new("12"));
+    }
+
+    #[test]
+    fn iter_seq_mut_and_iter_qual_mut_mutate_one_column() {
+        let mut bld = DualStringPodBuilder::with_capacity(4, 2);
+        bld.push(b("ACGT"), b("IIII"));
+        bld.push(b("TTGA"), b("FFFF"));
+        let mut p = bld.finish();
+
+        for s in p.iter_seq_mut() {
+            s.make_ascii_lowercase();
+        }
+        assert_eq!(p.seq(0), BStr::new("acgt"));
+        assert_eq!(p.seq(1), BStr::new("ttga"));
+        assert_eq!(p.qual(0), BStr::new("IIII")); // qual untouched
+        assert_eq!(p.qual(1), BStr::new("FFFF"));
+
+        for q in p.iter_qual_mut() {
+            q.reverse();
+        }
+        assert_eq!(p.qual(0), BStr::new("IIII")); // palindrome
+        assert_eq!(p.seq(0), BStr::new("acgt")); // seq untouched by qual pass
+    }
+
+    #[test]
+    fn iter_seq_mut_cows_only_seq_buffer() {
+        // Both columns shared with a clone. Mutating seq must COW seq alone and
+        // leave the clone's seq untouched; the qual buffer can stay shared.
+        let mut bld = DualStringPodBuilder::with_capacity(2, 1);
+        bld.push(b("AB"), b("12"));
+        let mut p = bld.finish();
+        let q = p.clone();
+        for s in p.iter_seq_mut() {
+            s.make_ascii_lowercase();
+        }
+        assert_eq!(p.seq(0), BStr::new("ab"));
+        assert_eq!(q.seq(0), BStr::new("AB")); // clone unaffected
+        assert_eq!(q.qual(0), BStr::new("12"));
+    }
+
+    #[test]
+    fn iter_seq_mut_double_ended_and_collectable() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 3);
+        bld.push(b("ACG"), b("III"));
+        bld.push(b("TTT"), b("###"));
+        bld.push(b("GCA"), b("FFF"));
+        let mut p = bld.finish();
+        {
+            let mut it = p.iter_seq_mut();
+            it.next().unwrap().reverse(); // ACG → GCA
+            it.next_back().unwrap().reverse(); // GCA → ACG
+        }
+        assert_eq!(p.seq(0), BStr::new("GCA"));
+        assert_eq!(p.seq(1), BStr::new("TTT")); // untouched
+        assert_eq!(p.seq(2), BStr::new("ACG"));
+
+        let all: Vec<&mut BStr> = p.iter_seq_mut().collect();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
@@ -1612,7 +1817,7 @@ mod tests {
         bld.push(b("GCA"), b("FFF"));
         let mut p = bld.finish();
         {
-            let mut it = p.try_iter_mut().unwrap();
+            let mut it = p.iter_mut();
             it.next().unwrap().seq.reverse(); // ACG → GCA
             it.next_back().unwrap().seq.reverse(); // GCA → ACG
         }
@@ -1629,7 +1834,7 @@ mod tests {
         let mut p = bld.finish();
         p.cut_start(1, None);
         p.cut_end(1, None); // visible seq: "ELL","ORL"; qual: "234","789"
-        for e in p.try_iter_mut().unwrap() {
+        for e in p.iter_mut() {
             e.seq.reverse();
             e.qual.reverse();
         }
@@ -1645,7 +1850,7 @@ mod tests {
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("JJ"));
         let mut p = bld.finish();
-        for e in p.try_iter_mut().unwrap() {
+        for e in p.iter_mut() {
             e.seq.make_ascii_lowercase();
         }
         assert_eq!(p.seq(0), BStr::new("acgtacgt"));
@@ -1663,7 +1868,7 @@ mod tests {
         let qual = fixed_pod(4, &["IIII", "FFFF"]); // qual_first_byte 0
         let mut dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         // Sources were moved in, so both Arcs are uniquely owned here.
-        for e in dual.try_iter_mut().unwrap() {
+        for e in dual.iter_mut() {
             e.seq.make_ascii_lowercase();
             e.qual.make_ascii_lowercase();
         }
@@ -1681,7 +1886,7 @@ mod tests {
         bld.push(b("CC"), b("33"));
         let mut p = bld.finish();
         {
-            let all: Vec<_> = p.try_iter_mut().unwrap().collect();
+            let all: Vec<_> = p.iter_mut().collect();
             assert_eq!(all.len(), 3);
             for e in all {
                 e.seq.make_ascii_lowercase();

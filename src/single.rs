@@ -369,11 +369,11 @@ impl StringPod {
 
     /// Returns a mutable iterator over entries, or `None` if the byte buffer
     /// is shared (Arc strong count > 1).
-    pub fn try_iter_mut(&mut self) -> Option<IterMut<'_>> {
+    pub fn iter_mut(&mut self) -> Option<IterMut<'_>> {
         let back = self.storage.len();
         // Disjoint fields: `data` borrowed mutably for the iterator, `storage`
         // immutably to drive the entry ranges.
-        let buffer = Arc::get_mut(&mut self.data)?.as_mut_slice();
+        let buffer = Arc::make_mut(&mut self.data).as_mut_slice();
         Some(IterMut {
             remaining: buffer,
             storage: &self.storage,
@@ -1570,7 +1570,7 @@ mod tests {
         bld.push(b("ABC"));
         bld.push(b("XYZ"));
         let mut p = bld.finish();
-        for entry in p.try_iter_mut().unwrap() {
+        for entry in p.iter_mut().unwrap() {
             entry.reverse();
         }
         assert_eq!(p.get(0), BStr::new("CBA"));
@@ -1578,12 +1578,12 @@ mod tests {
     }
 
     #[test]
-    fn iter_mut_returns_none_when_shared() {
+    fn iter_mut_returns_even_when_shared() {
         let mut bld = StringPodBuilder::with_capacity(3, 1);
         bld.push(b("ABC"));
         let mut p = bld.finish();
         let _q = p.clone();
-        assert!(p.try_iter_mut().is_none());
+        assert!(p.iter_mut().is_some());
     }
 
     #[test]
@@ -1594,7 +1594,7 @@ mod tests {
         bld.push(b("GHI"));
         let mut p = bld.finish();
         {
-            let mut it = p.try_iter_mut().unwrap();
+            let mut it = p.iter_mut().unwrap();
             it.next().unwrap().reverse(); // ABC → CBA
             it.next_back().unwrap().reverse(); // GHI → IHG
             // DEF untouched
@@ -1611,7 +1611,7 @@ mod tests {
         bld.push(b("hi"));
         bld.push(b("foobar"));
         let mut p = bld.finish();
-        for entry in p.try_iter_mut().unwrap() {
+        for entry in p.iter_mut().unwrap() {
             entry.make_ascii_uppercase();
         }
         assert_eq!(p.get(0), BStr::new("HELLO"));
@@ -1629,7 +1629,7 @@ mod tests {
         let mut p = bld.finish();
         p.cut_start(1, None);
         p.cut_end(1, None); // visible: "BCDE", "VWXY", "1234"
-        for entry in p.try_iter_mut().unwrap() {
+        for entry in p.iter_mut().unwrap() {
             entry.reverse();
         }
         assert_eq!(p.get(0), BStr::new("EDCB"));
@@ -1653,7 +1653,7 @@ mod tests {
             ab.finish()
         };
         drop(source); // make the shared buffer uniquely owned
-        for entry in aliased.try_iter_mut().unwrap() {
+        for entry in aliased.iter_mut().unwrap() {
             entry.make_ascii_lowercase();
         }
         assert_eq!(aliased.get(0), BStr::new("ell"));
@@ -1669,7 +1669,7 @@ mod tests {
         bld.push(b("gamma"));
         let mut p = bld.finish();
         {
-            let mut it = p.try_iter_mut().unwrap();
+            let mut it = p.iter_mut().unwrap();
             it.next().unwrap().make_ascii_uppercase(); // alpha → ALPHA
             it.next_back().unwrap().make_ascii_uppercase(); // gamma → GAMMA
         }
@@ -1687,7 +1687,7 @@ mod tests {
         bld.push(b("CC"));
         let mut p = bld.finish();
         {
-            let all: Vec<&mut BStr> = p.try_iter_mut().unwrap().collect();
+            let all: Vec<&mut BStr> = p.iter_mut().unwrap().collect();
             assert_eq!(all.len(), 3);
             for entry in all {
                 entry.make_ascii_lowercase();
