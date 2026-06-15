@@ -132,6 +132,15 @@ impl DualStringPodMultiLocation {
         self.source_id
     }
 
+    /// Re-stamp the opaque [`source_id`](Self::source_id). Used when the source
+    /// this snapshot aliases is relabelled wholesale (e.g. two read segments are
+    /// swapped as units, so a column captured against segment `a` now lifts and
+    /// writes back against segment `b`). The rows, byte aliases, born frames and
+    /// coordinates are unchanged — only the identifier of the segment they track.
+    pub fn set_source_id(&mut self, source_id: u32) {
+        self.source_id = source_id;
+    }
+
     /// `true` if there are no rows.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -321,7 +330,13 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn joined_seq(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         match &self.rows[row] {
-            Row::Alias (anchor) => join(&self.seq, self.seq_first_byte, anchor.base, &anchor.locs, sep),
+            Row::Alias(anchor) => join(
+                &self.seq,
+                self.seq_first_byte,
+                anchor.base,
+                &anchor.locs,
+                sep,
+            ),
             Row::Owned { off, len, .. } => {
                 let s = *off as usize;
                 Cow::Borrowed(BStr::new(&self.owned[s..s + *len as usize]))
@@ -338,7 +353,13 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn joined_qual(&self, row: usize, sep: Option<&[u8]>) -> Cow<'_, BStr> {
         match &self.rows[row] {
-            Row::Alias (anchor) => join(&self.qual, self.qual_first_byte, anchor.base, &anchor.locs, sep),
+            Row::Alias(anchor) => join(
+                &self.qual,
+                self.qual_first_byte,
+                anchor.base,
+                &anchor.locs,
+                sep,
+            ),
             Row::Owned { off, len, .. } => {
                 let s = *off as usize + *len as usize; //seq comes first, then qual
                 Cow::Borrowed(BStr::new(&self.owned[s..s + *len as usize]))
@@ -347,20 +368,17 @@ impl DualStringPodMultiLocation {
     }
 
     #[must_use]
-    pub fn joined_pair(&self, row: usize,sep: Option<& [u8]>) -> (
-    Cow<'_, BStr>,
-    Cow<'_, BStr>,
-){
-        (self.joined_seq(row, sep), 
-            self.joined_qual(row,sep)
-        )
+    pub fn joined_pair(&self, row: usize, sep: Option<&[u8]>) -> (Cow<'_, BStr>, Cow<'_, BStr>) {
+        (self.joined_seq(row, sep), self.joined_qual(row, sep))
     }
-
 
     /// Iterate the length of every row (sum of location lengths, plus
     /// `sep.is_some() as usize * (locs - 1)` separators). Mirrors the
     /// per-row computation of [`row_length`](Self::row_length).
-    pub fn iter_row_lengths<'a, 'b> (&'a self, sep: Option<&'a[u8]>) -> impl Iterator<Item = usize> + 'a {
+    pub fn iter_row_lengths<'a, 'b>(
+        &'a self,
+        sep: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = usize> + 'a {
         (0..self.rows.len()).map(move |row| self.row_length(row, sep))
     }
 
@@ -484,13 +502,22 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn row_span(&self, row: usize) -> (usize, usize) {
         match &self.rows[row] {
-            Row::Owned { anchor, .. } |
-            Row::Alias ( anchor) => {
+            Row::Owned { anchor, .. } | Row::Alias(anchor) => {
                 if anchor.locs.is_empty() {
                     return (0, 0);
                 }
-                let start = anchor.locs.iter().map(|&(s, _)| s).min().expect("non-empty");
-                let end = anchor.locs.iter().map(|&(s, l)| s + l).max().expect("non-empty");
+                let start = anchor
+                    .locs
+                    .iter()
+                    .map(|&(s, _)| s)
+                    .min()
+                    .expect("non-empty");
+                let end = anchor
+                    .locs
+                    .iter()
+                    .map(|&(s, l)| s + l)
+                    .max()
+                    .expect("non-empty");
                 (start as usize, (end - start) as usize)
             }
         }
@@ -532,14 +559,17 @@ impl DualStringPodMultiLocation {
             qual.len(),
         );
         let anchor = match &self.rows[row] {
-            Row::Alias (anchor) |
-            Row::Owned { anchor, ..}  => anchor
+            Row::Alias(anchor) | Row::Owned { anchor, .. } => anchor,
         };
         let off = u32::try_from(self.owned.len()).expect("owned arena offset exceeds u32");
         let len = u32::try_from(seq.len()).expect("owned content len exceeds u32");
         self.owned.extend_from_slice(seq);
         self.owned.extend_from_slice(qual);
-        self.rows[row] = Row::Owned { anchor: anchor.clone(), off, len };
+        self.rows[row] = Row::Owned {
+            anchor: anchor.clone(),
+            off,
+            len,
+        };
     }
 }
 
@@ -689,7 +719,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
             locs.push((rel_start, len));
         }
         self.born.push(self.born_of(entry_len));
-        self.rows.push(Row::Alias ( LocsAndBase {base, locs }));
+        self.rows.push(Row::Alias(LocsAndBase { base, locs }));
         self.next += 1;
     }
 
@@ -737,7 +767,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
             let len = u32::try_from(len).expect("alias len exceeds u32");
             locs.push((rel_start, len));
         }
-        let anchor = LocsAndBase{base, locs};
+        let anchor = LocsAndBase { base, locs };
         let off = u32::try_from(self.owned.len()).expect("owned arena offset exceeds u32");
         let len = u32::try_from(seq.len()).expect("owned content len exceeds u32");
         self.owned.extend_from_slice(seq);

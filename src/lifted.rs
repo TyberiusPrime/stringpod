@@ -59,14 +59,30 @@ pub trait Lifted {
         }
     }
 
-    /// Record a whole-column `prefix` of `k` bytes.
-    fn record_prefix(&mut self, k: usize) {
-        self.edits_mut().apply_all(|log| log.prefix(k));
+    /// Record a `prefix` of `k` bytes: whole-column when `cond` is `None`,
+    /// otherwise only the entries whose mask bit is set.
+    fn record_prefix(&mut self, k: usize, cond: Option<&[bool]>) {
+        match cond {
+            None => self.edits_mut().apply_all(|log| log.prefix(k)),
+            Some(mask) => self.edits_mut().apply_entries(|i, log| {
+                if mask[i] {
+                    log.prefix(k);
+                }
+            }),
+        }
     }
 
-    /// Record a whole-column `postfix` of `k` bytes.
-    fn record_postfix(&mut self, k: usize) {
-        self.edits_mut().apply_all(|log| log.postfix(k));
+    /// Record a `postfix` of `k` bytes: whole-column or masked, as for
+    /// [`record_prefix`](Self::record_prefix).
+    fn record_postfix(&mut self, k: usize, cond: Option<&[bool]>) {
+        match cond {
+            None => self.edits_mut().apply_all(|log| log.postfix(k)),
+            Some(mask) => self.edits_mut().apply_entries(|i, log| {
+                if mask[i] {
+                    log.postfix(k);
+                }
+            }),
+        }
     }
 
     /// Record a `reverse`: whole-column when `cond` is `None`, otherwise only

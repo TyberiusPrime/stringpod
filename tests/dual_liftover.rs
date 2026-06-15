@@ -46,7 +46,7 @@ fn lifts_a_tag_through_a_uniform_pipeline() {
 
     // A whole-segment pipeline: overlay cut, two rebuilds (Arc diverges).
     pod.cut_start(2, None);
-    pod = pod.prefix(b"XX", b"##");
+    pod = pod.prefix(b"XX", b"##", None);
     pod = pod.reverse(None);
 
     match lift(&pod, born, 0, 4, 4, orig) {
@@ -159,7 +159,10 @@ fn splice_entries_rewrites_bytes_and_carries_history() {
     // [6, 8) now lives at [4, 6).
     pod.cut_start(2, None);
     assert_eq!(pod.seq(0), BStr::new(b"CCGGTT"));
-    assert_eq!(lift(&pod, born, 0, 6, 2, 8), RegionLift::Kept { start: 4, len: 2 });
+    assert_eq!(
+        lift(&pod, born, 0, 6, 2, 8),
+        RegionLift::Kept { start: 4, len: 2 }
+    );
 
     // Splice read 0 only: at current offset 0, replace 2 bytes ("CC") with 3 ("xyz").
     pod.splice_entries(&[Some((0, 2, b"xyz".to_vec(), b"###".to_vec())), None]);
@@ -172,7 +175,13 @@ fn splice_entries_rewrites_bytes_and_carries_history() {
     // History survives the rebuild: the tag born at gen 0 lifts through *both* the
     // cut and the splice. Its [6, 8) sat at [4, 6) pre-splice; the +1 net insert
     // before it shifts it to [5, 7).
-    assert_eq!(lift(&pod, born, 0, 6, 2, 8), RegionLift::Kept { start: 5, len: 2 });
+    assert_eq!(
+        lift(&pod, born, 0, 6, 2, 8),
+        RegionLift::Kept { start: 5, len: 2 }
+    );
     // Read 1 saw only the cut.
-    assert_eq!(lift(&pod, born, 1, 6, 2, 8), RegionLift::Kept { start: 4, len: 2 });
+    assert_eq!(
+        lift(&pod, born, 1, 6, 2, 8),
+        RegionLift::Kept { start: 4, len: 2 }
+    );
 }

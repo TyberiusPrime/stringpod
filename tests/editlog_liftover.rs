@@ -538,7 +538,7 @@ fn dual_alias_lifts_seq_and_qual_together() {
 
     source.cut_start(1, None);
     log.cut_start(1);
-    source = source.postfix(b"NN", b"##");
+    source = source.postfix(b"NN", b"##", None);
     log.postfix(2);
 
     // One coordinate map serves both buffers of the dual pod.

@@ -242,7 +242,7 @@ impl StringPod {
         // Carry the edit history across the rebuild and append the prefix op.
         let mut out = bld.finish();
         out.edits = self.edits;
-        out.record_prefix(text.len());
+        out.record_prefix(text.len(), None);
         out
     }
 
@@ -268,7 +268,7 @@ impl StringPod {
         }
         let mut out = bld.finish();
         out.edits = self.edits;
-        out.record_postfix(text.len());
+        out.record_postfix(text.len(), None);
         out
     }
 

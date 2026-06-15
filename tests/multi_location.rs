@@ -164,7 +164,7 @@ fn snapshot_is_frozen_across_source_edits() {
     );
 
     // Rebuild (prefix → fresh Arc; snapshot keeps the old one).
-    source = source.prefix(b"XX", b"##");
+    source = source.prefix(b"XX", b"##", None);
     assert_eq!(
         snap.joined_pair(0, None),
         (
@@ -240,8 +240,20 @@ fn aliases_correctly_through_divergent_first_byte() {
         b.push_row(&[(0, 4)]); // "TTTT" / "FFFF"
         b.finish()
     };
-    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("CG")), Cow::Borrowed(BStr::new("II"))));
-    assert_eq!(snap.joined_pair(1, None), (Cow::Borrowed(BStr::new("TTTT")), Cow::Borrowed(BStr::new("FFFF"))));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("CG")),
+            Cow::Borrowed(BStr::new("II"))
+        )
+    );
+    assert_eq!(
+        snap.joined_pair(1, None),
+        (
+            Cow::Borrowed(BStr::new("TTTT")),
+            Cow::Borrowed(BStr::new("FFFF"))
+        )
+    );
 }
 
 #[test]
@@ -254,7 +266,13 @@ fn make_exclusive_detaches_from_source() {
     };
     snap.make_exclusive();
     drop(source);
-    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("ACGT")), Cow::Borrowed(BStr::new("IIII"))));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("ACGT")),
+            Cow::Borrowed(BStr::new("IIII"))
+        )
+    );
 }
 
 #[test]
@@ -303,9 +321,24 @@ fn push_row_from_ranges_matches_tuple_form() {
     assert_eq!(snap.loc_region(0, 1), (8, 4));
     assert!(snap.row_is_empty(1));
     assert_eq!(snap.loc_region(2, 0), (4, 4));
-    assert_eq!(snap.joined_pair(0, None), (Cow::Borrowed(BStr::new("AAGTACGT")), Cow::Borrowed(BStr::new("IIIIJJJJ"))));
-    assert_eq!(snap.joined_pair(1, None), (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new(""))));
-    assert_eq!(snap.joined_pair(2, None), (Cow::Borrowed(BStr::new("CCCC")), Cow::Borrowed(BStr::new("2222"))));
+    assert_eq!(
+        snap.joined_pair(0, None),
+        (
+            Cow::Borrowed(BStr::new("AAGTACGT")),
+            Cow::Borrowed(BStr::new("IIIIJJJJ"))
+        )
+    );
+    assert_eq!(
+        snap.joined_pair(1, None),
+        (Cow::Borrowed(BStr::new("")), Cow::Borrowed(BStr::new("")))
+    );
+    assert_eq!(
+        snap.joined_pair(2, None),
+        (
+            Cow::Borrowed(BStr::new("CCCC")),
+            Cow::Borrowed(BStr::new("2222"))
+        )
+    );
 }
 
 #[test]

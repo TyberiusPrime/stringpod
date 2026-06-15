@@ -406,14 +406,18 @@ impl DualStringPod {
         (0..self.len()).map(move |i| self.storage.entry_len(i))
     }
 
-    /// Prepend `seq_text` / `qual_text` to every entry in the respective
-    /// columns, rebuilding both buffers. The two texts must have the same
-    /// length (so the `seq.len() == qual.len()` invariant is preserved).
+    /// Prepend `seq_text` / `qual_text` to entries in the respective columns,
+    /// rebuilding both buffers. The two texts must have the same length (so the
+    /// `seq.len() == qual.len()` invariant is preserved).
+    ///
+    /// If `conditional` is `Some`, only entries whose mask bit is set get the
+    /// prefix (in both the bytes and the recorded coordinate edit); the rest are
+    /// copied through untouched. `None` prefixes every entry.
     ///
     /// # Panics
     /// If `seq_text.len() != qual_text.len()`.
     #[must_use]
-    pub fn prefix(self, seq_text: &[u8], qual_text: &[u8]) -> Self {
+    pub fn prefix(self, seq_text: &[u8], qual_text: &[u8], conditional: Option<&[bool]>) -> Self {
         assert_eq!(
             seq_text.len(),
             qual_text.len(),
@@ -431,11 +435,14 @@ impl DualStringPod {
         let mut seq_buf = Vec::with_capacity(first_len);
         let mut qual_buf = Vec::with_capacity(first_len);
         for i in 0..n {
+            let apply = conditional.is_none_or(|cond| cond[i]);
             seq_buf.clear();
-            seq_buf.extend_from_slice(seq_text);
-            seq_buf.extend_from_slice(self.seq(i));
             qual_buf.clear();
-            qual_buf.extend_from_slice(qual_text);
+            if apply {
+                seq_buf.extend_from_slice(seq_text);
+                qual_buf.extend_from_slice(qual_text);
+            }
+            seq_buf.extend_from_slice(self.seq(i));
             qual_buf.extend_from_slice(self.qual(i));
             bld.push(&seq_buf, &qual_buf);
         }
@@ -443,18 +450,21 @@ impl DualStringPod {
         // the snapshot bytes part company from the live ones) and append the op.
         let mut out = bld.finish();
         out.edits = self.edits;
-        out.record_prefix(seq_text.len());
+        out.record_prefix(seq_text.len(), conditional);
         out
     }
 
-    /// Append `seq_text` / `qual_text` to every entry in the respective
-    /// columns, rebuilding both buffers. The two texts must have the same
-    /// length.
+    /// Append `seq_text` / `qual_text` to entries in the respective columns,
+    /// rebuilding both buffers. The two texts must have the same length.
+    ///
+    /// If `conditional` is `Some`, only entries whose mask bit is set get the
+    /// postfix; the rest are copied through untouched. `None` postfixes every
+    /// entry.
     ///
     /// # Panics
     /// If `seq_text.len() != qual_text.len()`.
     #[must_use]
-    pub fn postfix(self, seq_text: &[u8], qual_text: &[u8]) -> Self {
+    pub fn postfix(self, seq_text: &[u8], qual_text: &[u8], conditional: Option<&[bool]>) -> Self {
         assert_eq!(
             seq_text.len(),
             qual_text.len(),
@@ -472,17 +482,20 @@ impl DualStringPod {
         let mut seq_buf = Vec::with_capacity(first_len);
         let mut qual_buf = Vec::with_capacity(first_len);
         for i in 0..n {
+            let apply = conditional.is_none_or(|cond| cond[i]);
             seq_buf.clear();
-            seq_buf.extend_from_slice(self.seq(i));
-            seq_buf.extend_from_slice(seq_text);
             qual_buf.clear();
+            seq_buf.extend_from_slice(self.seq(i));
             qual_buf.extend_from_slice(self.qual(i));
-            qual_buf.extend_from_slice(qual_text);
+            if apply {
+                seq_buf.extend_from_slice(seq_text);
+                qual_buf.extend_from_slice(qual_text);
+            }
             bld.push(&seq_buf, &qual_buf);
         }
         let mut out = bld.finish();
         out.edits = self.edits;
-        out.record_postfix(seq_text.len());
+        out.record_postfix(seq_text.len(), conditional);
         out
     }
 
@@ -1582,7 +1595,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(3, 2);
         bld.push(b("AAA"), b("###"));
         bld.push(b("BBB"), b("$$$"));
-        let p = bld.finish().prefix(b("XX"), b("!!"));
+        let p = bld.finish().prefix(b("XX"), b("!!"), None);
         assert!(p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("XXAAA"));
         assert_eq!(p.qual(0), BStr::new("!!###"));
@@ -1595,7 +1608,7 @@ mod tests {
         let mut bld = DualStringPodBuilder::with_capacity(3, 2);
         bld.push(b("AAA"), b("###"));
         bld.push(b("BBB"), b("$$$"));
-        let p = bld.finish().postfix(b("ZZ"), b("++"));
+        let p = bld.finish().postfix(b("ZZ"), b("++"), None);
         assert!(p.is_fixed_length());
         assert_eq!(p.seq(0), BStr::new("AAAZZ"));
         assert_eq!(p.qual(0), BStr::new("###++"));
@@ -1605,7 +1618,7 @@ mod tests {
     #[should_panic(expected = "seq_text.len()")]
     fn dual_prefix_length_mismatch_panics() {
         let p = DualStringPod::empty();
-        let _ = p.prefix(b("AB"), b("X"));
+        let _ = p.prefix(b("AB"), b("X"), None);
     }
 
     // ── max_len ───────────────────────────────────────────────────────────

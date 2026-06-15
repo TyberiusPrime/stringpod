@@ -56,8 +56,14 @@ fn owned_and_alias_rows_coexist() {
     assert_eq!(snap.joined_seq(1, None).as_ref(), BStr::new("AGTC"));
     assert_eq!(snap.joined_qual(1, None).as_ref(), BStr::new("BBBB"));
     // covered_positions reflects the (empty) anchor, not the content.
-    assert_eq!(snap.covered_positions(0).collect::<Vec<_>>(), vec![0,1,2,3]);
-    assert_eq!(snap.covered_positions(1).collect::<Vec<_>>(), vec![4,5,6,7]);
+    assert_eq!(
+        snap.covered_positions(0).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+    assert_eq!(
+        snap.covered_positions(1).collect::<Vec<_>>(),
+        vec![4, 5, 6, 7]
+    );
 
     // No-hit row stays empty.
     assert!(snap.row_is_empty(2));
@@ -79,7 +85,10 @@ fn owned_row_with_real_anchor_and_doubled_content() {
     assert_eq!(snap.joined_seq(0, None), BStr::new("GTACGTAC"));
     assert_eq!(snap.joined_qual(0, None), BStr::new("23452345"));
     assert_eq!(snap.loc_region(0, 0), (2, 4));
-    assert_eq!(snap.covered_positions(0).collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+    assert_eq!(
+        snap.covered_positions(0).collect::<Vec<_>>(),
+        vec![2, 3, 4, 5]
+    );
     assert_eq!(snap.row_length(0, None), 4);
 }
 

@@ -422,6 +422,38 @@ impl EditLog {
     }
 }
 
+/// Write `ops` as a human-readable, left-to-right list (`cut 6 from start, then
+/// reverse`). Shared by the [`Display`](std::fmt::Display) impls of [`EditLog`]
+/// and [`EditLogView`] so error messages can explain *why* a coordinate moved or
+/// was lost. An empty list reads `(no edits)`.
+fn fmt_ops(ops: &[Op], f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    if ops.is_empty() {
+        return f.write_str("(no edits)");
+    }
+    for (i, op) in ops.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", then ")?;
+        }
+        match *op {
+            Op::CutStart(n) => write!(f, "cut {n} from the start")?,
+            Op::CutEnd(n) => write!(f, "cut {n} from the end")?,
+            Op::Prefix(k) => write!(f, "prepend {k} base(s)")?,
+            Op::Postfix(k) => write!(f, "append {k} base(s)")?,
+            Op::Splice { at, del, ins } => {
+                write!(f, "at offset {at} delete {del} and insert {ins} base(s)")?;
+            }
+            Op::Reflect => f.write_str("reverse")?,
+        }
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for EditLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_ops(&self.ops, f)
+    }
+}
+
 /// A borrowed window over a *suffix* of an [`EditLog`]'s edits, produced by
 /// [`EditLog::view_from`]. Lifts coordinates from the frame at the window's
 /// start into the current frame, with the same semantics as [`EditLog`] —
@@ -429,6 +461,12 @@ impl EditLog {
 #[derive(Clone, Copy, Debug)]
 pub struct EditLogView<'a> {
     ops: &'a [Op],
+}
+
+impl std::fmt::Display for EditLogView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fmt_ops(self.ops, f)
+    }
 }
 
 impl EditLogView<'_> {
