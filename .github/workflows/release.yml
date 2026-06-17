@@ -43,8 +43,17 @@ jobs:
       - name: Audit dependencies with cargo-deny
         run: nix develop .#deny --command cargo deny check advisories bans sources
 
+      - name: fmt
+        run: nix build -L ".#test.x86_64-linux.fmt"
+
+      - name: clippy
+        run: nix build -L ".#test.x86_64-linux.clippy"
+
+      - name: clippy
+        run: nix build -L ".#test.x86_64-linux.msrv"
+
       - name: Test
-        run: nix build -L ".#test.x86_64-linux.${{ matrix.job }}"
+        run: nix build -L ".#test.x86_64-linux.stable"
 
   publish-crate:
     name: Publish to crates.io
