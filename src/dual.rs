@@ -513,6 +513,11 @@ impl DualStringPod {
     /// - If `edits.len() != self.len()`.
     /// - If any `ins_seq.len() != ins_qual.len()`.
     /// - If any `at + del` exceeds the entry's current length.
+    #[expect(
+        clippy::type_complexity,
+        reason = "Yeah, it's a tuple. Could be improved"
+    )]
+    #[expect(clippy::needless_range_loop, reason = "i is used multiple times")]
     pub fn splice_entries(&mut self, edits: &[Option<(usize, usize, Vec<u8>, Vec<u8>)>]) {
         assert_eq!(
             edits.len(),
@@ -1802,7 +1807,7 @@ mod tests {
         bld.push(b("ACGT"), b("IIII"));
         bld.push(b("TTTT"), b("####"));
         let mut p = bld.finish();
-        for entry in p.iter_mut() {
+        for entry in &mut p {
             entry.seq.reverse();
             entry.qual.reverse();
         }
@@ -1821,7 +1826,7 @@ mod tests {
         bld.push(b("AB"), b("12"));
         let mut p = bld.finish();
         let q = p.clone();
-        for e in p.iter_mut() {
+        for e in &mut p {
             e.seq.make_ascii_lowercase();
             e.qual.reverse();
         }
@@ -1915,7 +1920,7 @@ mod tests {
         let mut p = bld.finish();
         p.cut_start(1, None);
         p.cut_end(1, None); // visible seq: "ELL","ORL"; qual: "234","789"
-        for e in p.iter_mut() {
+        for e in &mut p {
             e.seq.reverse();
             e.qual.reverse();
         }
@@ -1931,7 +1936,7 @@ mod tests {
         bld.push(b("ACGTACGT"), b("IIIIIIII"));
         bld.push(b("AC"), b("JJ"));
         let mut p = bld.finish();
-        for e in p.iter_mut() {
+        for e in &mut p {
             e.seq.make_ascii_lowercase();
         }
         assert_eq!(p.seq(0), BStr::new("acgtacgt"));
@@ -1949,7 +1954,7 @@ mod tests {
         let qual = fixed_pod(4, &["IIII", "FFFF"]); // qual_first_byte 0
         let mut dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         // Sources were moved in, so both Arcs are uniquely owned here.
-        for e in dual.iter_mut() {
+        for e in &mut dual {
             e.seq.make_ascii_lowercase();
             e.qual.make_ascii_lowercase();
         }

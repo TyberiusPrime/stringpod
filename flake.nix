@@ -26,7 +26,7 @@
         #   * `#[expect(...)]` lint attribute (stable since 1.81)
         #   * edition 2024
         rustMsrv = pkgs.rust-bin.stable."1.85.0".default;
-        rustStable = rustMsrv;
+        rustStable = pkgs.rust-bin.stable."1.93.0".default;
         rust = rustMsrv;
 
         # Override the version used in naersk

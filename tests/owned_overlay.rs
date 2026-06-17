@@ -16,6 +16,7 @@ fn read_pod(entries: &[(&str, &str)]) -> DualStringPod {
 }
 
 #[test]
+#[expect(clippy::single_range_in_vec_init, reason = "reasonable")]
 fn owned_and_alias_rows_coexist() {
     // read 0: alias window; read 1: owned (conjured/divergent); read 2: no hit.
     let source = read_pod(&[

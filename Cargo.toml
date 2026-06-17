@@ -1,6 +1,6 @@
 [package]
 name = "stringpod"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -9,8 +9,6 @@ description = "Cache-friendly columnar storage for many small byte strings (FAST
 [dependencies]
 bstr = "1"
 smallvec = { version = "1.15.1", features = ["union"] }
-
-
 
 
 [lints.clippy]

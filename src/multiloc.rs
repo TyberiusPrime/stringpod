@@ -172,7 +172,8 @@ impl DualStringPodMultiLocation {
 
     /// The length spanned by the regions.
     /// Assumes disjoint regions!
-    pub fn row_length<'a, 'b>(&'a self, row: usize, sep: Option<&[u8]>) -> usize {
+    #[must_use]
+    pub fn row_length(&self, row: usize, sep: Option<&[u8]>) -> usize {
         match &self.rows[row] {
             Row::Alias(anchor) | Row::Owned { anchor, .. } => {
                 let mut total = 0;
@@ -247,11 +248,7 @@ impl DualStringPodMultiLocation {
     #[must_use]
     pub fn loc_region(&self, row: usize, loc: usize) -> (usize, usize) {
         match &self.rows[row] {
-            Row::Alias(anchor) => {
-                let (rel, len) = anchor.locs[loc];
-                (rel as usize, len as usize)
-            }
-            Row::Owned { anchor, .. } => {
+            Row::Alias(anchor) | Row::Owned { anchor, .. } => {
                 let (rel, len) = anchor.locs[loc];
                 (rel as usize, len as usize)
             }
@@ -285,10 +282,14 @@ impl DualStringPodMultiLocation {
     ///
     /// # Panics
     /// If `row >= self.row_count()`.
+    /// If start or len > `u32::MAX`
     pub fn row_regions(&self, row: usize) -> impl Iterator<Item = (u32, u32)> + '_ {
         (0..self.loc_count_in(row)).map(move |loc| {
             let (start, len) = self.loc_region(row, loc);
-            (start as u32, len as u32)
+            (
+                start.try_into().expect("u32 exceeded by start"),
+                len.try_into().expect("u32 exceeded by len"),
+            )
         })
     }
 
@@ -375,7 +376,7 @@ impl DualStringPodMultiLocation {
     /// Iterate the length of every row (sum of location lengths, plus
     /// `sep.is_some() as usize * (locs - 1)` separators). Mirrors the
     /// per-row computation of [`row_length`](Self::row_length).
-    pub fn iter_row_lengths<'a, 'b>(
+    pub fn iter_row_lengths<'a>(
         &'a self,
         sep: Option<&'a [u8]>,
     ) -> impl Iterator<Item = usize> + 'a {
@@ -442,6 +443,8 @@ impl DualStringPodMultiLocation {
     /// Poor man's retain, where the F doesn't get to look
     /// at the actual contents.
     /// Mostly use ful for filtering on a bool iter of the same length
+    /// # Panics
+    /// If the mask length != the row length (impossible)
     pub fn retain<F>(&mut self, mut f: F)
     where
         F: FnMut() -> bool,
@@ -499,6 +502,8 @@ impl DualStringPodMultiLocation {
     /// write-back anchor.
     ///
     /// (`min(start) .. max(start+len)`); for a no-hit row, `(0, 0)`.
+    /// # Panics
+    /// If `anchor.locs.is_empty()` lies. Impossible
     #[must_use]
     pub fn row_span(&self, row: usize) -> (usize, usize) {
         match &self.rows[row] {
@@ -714,9 +719,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
                 end <= entry_len,
                 "alias offset {offset}+len {len}={end} exceeds entry length {entry_len}",
             );
-            let rel_start = u32::try_from(offset).expect("alias offset exceeds u32");
-            let len = u32::try_from(len).expect("alias len exceeds u32");
-            locs.push((rel_start, len));
+            locs.push((offset, len));
         }
         self.born.push(self.born_of(entry_len));
         self.rows.push(Row::Alias(LocsAndBase { base, locs }));
@@ -763,9 +766,7 @@ impl DualStringPodMultiLocationAliasBuilder<'_> {
                 end <= entry_len,
                 "alias offset {offset}+len {len}={end} exceeds entry length {entry_len}",
             );
-            let rel_start = u32::try_from(offset).expect("alias offset exceeds u32");
-            let len = u32::try_from(len).expect("alias len exceeds u32");
-            locs.push((rel_start, len));
+            locs.push((offset, len));
         }
         let anchor = LocsAndBase { base, locs };
         let off = u32::try_from(self.owned.len()).expect("owned arena offset exceeds u32");

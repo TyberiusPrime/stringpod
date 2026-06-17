@@ -111,9 +111,8 @@ fn iter_seq_qual_pair_yield_per_row_captured_values() {
     // `Option<(seq, qual)>` per row — `None` for the no-hit row.
     assert_eq!(snap.iter().len(), 3);
     let mut pairs: Vec<(Cow<BStr>, Cow<BStr>)> = Vec::new();
-    dbg!(&snap);
     for pair in &snap {
-        pairs.push(pair)
+        pairs.push(pair);
     }
     assert_eq!(pairs.len(), 3);
     assert_eq!(
@@ -130,10 +129,10 @@ fn iter_seq_qual_pair_yield_per_row_captured_values() {
 
     assert_eq!(
         pairs[2],
-        ((
+        (
             Cow::Borrowed(BStr::new("CCCC")),
             Cow::Borrowed(BStr::new("2222"))
-        ))
+        )
     );
 }
 
@@ -301,6 +300,7 @@ fn iter_row_lengths_sums_locations_with_and_without_sep() {
 }
 
 #[test]
+#[expect(clippy::single_range_in_vec_init, reason = "reasonable")]
 fn push_row_from_ranges_matches_tuple_form() {
     // The range front door must produce the exact same snapshot as the
     // `(start, len)` form: `0..4` ≡ `(0, 4)`, `8..12` ≡ `(8, 4)`.
@@ -343,6 +343,8 @@ fn push_row_from_ranges_matches_tuple_form() {
 
 #[test]
 #[should_panic(expected = "reversed range")]
+#[expect(clippy::reversed_empty_ranges, reason = "this is the test")]
+#[expect(clippy::single_range_in_vec_init, reason = "reasonable")]
 fn push_row_from_ranges_rejects_reversed_range() {
     let source = read_pod(&[("ACGT", "IIII")]);
     let mut b = source.multi_location_alias_builder();
