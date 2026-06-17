@@ -48,6 +48,7 @@ jobs:
 
   publish-crate:
     name: Publish to crates.io
+    environment: release
     runs-on: ubuntu-latest
     needs: [build]  # Ensure all platforms and docker tests pass before publishing
 
