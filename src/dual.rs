@@ -646,6 +646,77 @@ impl DualStringPod {
         self.debug_assert_within_buffers();
     }
 
+    /// Reclaim space orphaned by index-only edits. Both columns are moved into
+    /// fresh, exactly-sized buffers (one allocation per column, no over-reserve)
+    /// holding each entry's visible bytes contiguously in view order; any bytes
+    /// hidden by cut / drop / slice / truncate overlays are dropped. After this
+    /// `buffer_bytes() == used_bytes()` and the pod owns its buffers outright
+    /// (the previous `Arc`s are released, so a shared buffer is left untouched).
+    ///
+    /// This is the explicit, user-driven counterpart to the crate's
+    /// index-only-by-default alterations — they never compact behind your back,
+    /// so call this when, and only when, reclamation matters. The visible
+    /// contents, entry count, fixed/variable layout and edit history are
+    /// unchanged (no coordinate edit is recorded — the visible frame is
+    /// identical, only its backing storage moves).
+    ///
+    /// # Panics
+    /// If the compacted byte total or entry count exceeds `u32::MAX` (the same
+    /// bound the builders enforce).
+    pub fn compact(&mut self) {
+        let count = self.len();
+        // Exact visible-byte total — identical for both columns by the seq/qual
+        // length invariant — so each buffer is a single right-sized allocation.
+        let total: usize = (0..count).map(|i| self.entry_len(i)).sum();
+        let was_fixed = self.storage.current_stride().is_some();
+        let mut seq = Vec::with_capacity(total);
+        let mut qual = Vec::with_capacity(total);
+        let mut positions: Vec<(u32, u32)> = if was_fixed {
+            Vec::new()
+        } else {
+            Vec::with_capacity(count)
+        };
+        for i in 0..count {
+            let start = u32::try_from(seq.len()).expect("byte buffer exceeds u32::MAX");
+            let (s, q) = self.pair(i);
+            seq.extend_from_slice(s);
+            qual.extend_from_slice(q);
+            if !was_fixed {
+                let stop = u32::try_from(seq.len()).expect("byte buffer exceeds u32::MAX");
+                positions.push((start, stop));
+            }
+        }
+        let storage = if was_fixed {
+            // FixedLength stays FixedLength: post-compaction stride == the (now
+            // uniform, overlay-free) visible length.
+            let stride = if count == 0 {
+                self.storage.current_stride().unwrap_or(0)
+            } else {
+                u32::try_from(self.entry_len(0)).expect("entry length exceeds u32::MAX")
+            };
+            Storage::FixedLength {
+                stride,
+                head_skip: 0,
+                visible_len: stride,
+                count: u32::try_from(count).expect("entry count exceeds u32::MAX"),
+                front_byte: 0,
+            }
+        } else {
+            Storage::Variable(VariableInfo {
+                positions,
+                head_skip: 0,
+                tail_skip: 0,
+                front_skip: 0,
+            })
+        };
+        self.seq = Arc::new(seq);
+        self.qual = Arc::new(qual);
+        self.storage = storage;
+        self.seq_first_byte = 0;
+        self.qual_first_byte = 0;
+        self.debug_assert_within_buffers();
+    }
+
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
     /// `f(i, seq, qual)` with the entry's current visible sequence and quality
     /// bytes. The closure returns:
@@ -1503,6 +1574,70 @@ mod tests {
         assert_eq!(s.qual(0), BStr::new("789"));
         assert_eq!(s.seq(1), BStr::new("UST"));
         assert_eq!(s.qual(1), BStr::new("bcd"));
+    }
+
+    #[test]
+    fn compact_dual_fixed_reclaims_orphans_and_stays_fixed() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        bld.push(b("RUSTY"), b("abcde"));
+        let mut p = bld.finish();
+        p.cut_start(1, None); // drop col 0 of every entry
+        p.cut_end(1, None); // drop col 4 of every entry
+        p.pop_front(1); // drop row 0
+        assert_eq!(p.len(), 2);
+        assert!(p.buffer_bytes() > p.used_bytes());
+
+        p.compact();
+
+        assert!(p.is_fixed_length());
+        assert_eq!(p.buffer_bytes(), p.used_bytes());
+        assert_eq!(p.buffer_bytes(), 6); // 2 entries × 3 visible bytes
+        assert_eq!(p.seq(0), BStr::new("ORL"));
+        assert_eq!(p.qual(0), BStr::new("789"));
+        assert_eq!(p.seq(1), BStr::new("UST"));
+        assert_eq!(p.qual(1), BStr::new("bcd"));
+    }
+
+    #[test]
+    fn compact_dual_variable_reclaims_and_preserves_pairs() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAA"), b("iiii")); // 4
+        bld.push(b("BBBBBB"), b("jjjjjj")); // 6
+        bld.push(b("CC"), b("kk")); // 2
+        let mut p = bld.finish();
+        p.max_len(3, None); // index-only clip → orphans
+        p.drain(0..1); // drop first pair
+        assert_eq!(p.len(), 2);
+        assert!(p.buffer_bytes() > p.used_bytes());
+
+        p.compact();
+
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.buffer_bytes(), p.used_bytes());
+        assert_eq!(p.buffer_bytes(), 5); // "BBB" + "CC"
+        assert_eq!(p.seq(0), BStr::new("BBB"));
+        assert_eq!(p.qual(0), BStr::new("jjj"));
+        assert_eq!(p.seq(1), BStr::new("CC"));
+        assert_eq!(p.qual(1), BStr::new("kk"));
+    }
+
+    #[test]
+    fn compact_dual_clones_shared_buffers() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"), b("xxx"));
+        bld.push(b("BBB"), b("yyy"));
+        let original = bld.finish();
+        let mut view = original.slice(1..2); // shares both Arcs
+
+        view.compact();
+
+        assert_eq!(original.len(), 2);
+        assert_eq!(original.buffer_bytes(), 6); // untouched
+        assert_eq!(view.buffer_bytes(), 3);
+        assert_eq!(view.seq(0), BStr::new("BBB"));
+        assert_eq!(view.qual(0), BStr::new("yyy"));
     }
 
     #[test]

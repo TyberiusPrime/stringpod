@@ -157,6 +157,33 @@ fn max_len_lifts_through_a_slice_with_offset() {
 }
 
 #[test]
+fn compact_preserves_liftover() {
+    // `compact` relocates bytes but leaves the visible coordinate frame
+    // unchanged, so it records no edit and a tag still lifts onto its bytes.
+    let mut bld = DualStringPodBuilder::with_capacity(0, 2);
+    bld.push(b"AAAACCCCGG", b"IIIIIIIIII"); // row 0, len 10
+    bld.push(b"TTTTGGGGAA", b"FFFFFFFFFF"); // row 1, len 10
+    let mut pod = bld.finish();
+
+    // Tag born on row 1 at [4, 8) ("GGGG"). Clip + drop to strand orphan bytes.
+    let born = pod.generation(1).expect("row 1 exists");
+    pod.max_len(8, None); // index-only clip, leaves orphans
+    pod.drain(0..1); // row 1 -> row 0
+    assert!(pod.buffer_bytes() > pod.used_bytes());
+
+    pod.compact();
+    assert_eq!(pod.buffer_bytes(), pod.used_bytes());
+
+    // The tag's [4, 8) ("GGGG") is inside the kept prefix and still names "GGGG".
+    match lift(&pod, born, 0, 4, 4, 10) {
+        RegionLift::Kept { start, len } => {
+            assert_eq!(&pod.seq(0)[start..start + len], BStr::new("GGGG"));
+        }
+        RegionLift::Dropped => panic!("expected Kept, got Dropped"),
+    }
+}
+
+#[test]
 fn write_back_splice_is_isolated_to_its_read() {
     let mut bld = DualStringPodBuilder::with_capacity(0, 2);
     bld.push(b"ACGTACGT", b"IIIIIIII"); // len 8

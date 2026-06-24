@@ -35,9 +35,16 @@ A direct consequence: index-only alterations never reclaim space. Truncated
 tails, dropped entries and sliced-away regions stay resident in the buffer as
 unreferenced bytes (`used_bytes()` shrinks; `buffer_bytes()` does not).
 **Compaction is an explicit, separate, user-level step**, orthogonal to the
-alterations themselves — rebuild through a fresh `*Builder` when, and only when,
-reclamation actually matters to you. Operations never compact behind your back,
-so their cost stays predictable.
+alterations themselves. Operations never compact behind your back, so their cost
+stays predictable; call `compact()` when, and only when, reclamation actually
+matters to you.
+
+`pod.compact()` moves every entry's visible bytes into a fresh, exactly-sized
+buffer (one allocation per column — `seq` and `qual` for a `DualStringPod`),
+drops the orphaned bytes, and leaves the pod owning its buffer outright (a
+shared `Arc` is left untouched). Visible contents, entry count, fixed/variable
+layout and edit history are all preserved — only the backing storage moves —
+so it's safe to call at any point. Afterwards `buffer_bytes() == used_bytes()`.
 
 ## Storage strategy
 

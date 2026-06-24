@@ -317,6 +317,68 @@ impl StringPod {
         self
     }
 
+    /// Reclaim space orphaned by index-only edits. The column is moved into a
+    /// fresh, exactly-sized buffer (one allocation, no over-reserve) holding
+    /// each entry's visible bytes contiguously in view order; any bytes hidden
+    /// by cut / drop / slice / truncate overlays are dropped. After this
+    /// `buffer_bytes() == used_bytes()` and the pod owns its buffer outright
+    /// (the previous `Arc` is released, so a shared buffer is left untouched).
+    ///
+    /// This is the explicit, user-driven counterpart to the crate's
+    /// index-only-by-default alterations — they never compact behind your back,
+    /// so call this when, and only when, reclamation matters. The visible
+    /// contents, entry count, fixed/variable layout and edit history are
+    /// unchanged (no coordinate edit is recorded — the visible frame is
+    /// identical, only its backing storage moves).
+    ///
+    /// # Panics
+    /// If the compacted byte total or entry count exceeds `u32::MAX` (the same
+    /// bound the builders enforce).
+    pub fn compact(&mut self) {
+        let count = self.len();
+        let total: usize = (0..count).map(|i| self.entry_len(i)).sum();
+        let was_fixed = self.storage.current_stride().is_some();
+        let mut data = Vec::with_capacity(total);
+        let mut positions: Vec<(u32, u32)> = if was_fixed {
+            Vec::new()
+        } else {
+            Vec::with_capacity(count)
+        };
+        for i in 0..count {
+            let start = u32::try_from(data.len()).expect("byte buffer exceeds u32::MAX");
+            data.extend_from_slice(self.get(i));
+            if !was_fixed {
+                let stop = u32::try_from(data.len()).expect("byte buffer exceeds u32::MAX");
+                positions.push((start, stop));
+            }
+        }
+        let storage = if was_fixed {
+            // FixedLength stays FixedLength: post-compaction stride == the (now
+            // uniform, overlay-free) visible length.
+            let stride = if count == 0 {
+                self.storage.current_stride().unwrap_or(0)
+            } else {
+                u32::try_from(self.entry_len(0)).expect("entry length exceeds u32::MAX")
+            };
+            Storage::FixedLength {
+                stride,
+                head_skip: 0,
+                visible_len: stride,
+                count: u32::try_from(count).expect("entry count exceeds u32::MAX"),
+                front_byte: 0,
+            }
+        } else {
+            Storage::Variable(VariableInfo {
+                positions,
+                head_skip: 0,
+                tail_skip: 0,
+                front_skip: 0,
+            })
+        };
+        self.data = Arc::new(data);
+        self.storage = storage;
+    }
+
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
     /// `f(i, entry)` with the entry's current visible bytes. The closure
     /// returns:
@@ -1483,6 +1545,77 @@ mod tests {
         assert_eq!(p.get(0), BStr::new("ABC"));
         assert_eq!(p.get(1), BStr::new("AB"));
         assert_eq!(p.get(2), BStr::new("ABC"));
+    }
+
+    // ── compact ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn compact_fixed_reclaims_overlay_orphans_and_stays_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("RUSTY"));
+        let mut p = bld.finish();
+        // Index-only edits leave orphaned bytes: cut both ends and drop a row.
+        p.cut_start(1, None); // "ELLO" / "ORLD" / "USTY"
+        p.cut_end(1, None); // "ELL"  / "ORL"  / "UST"
+        p.pop_front(1); // drop row 0
+        assert_eq!(p.len(), 2);
+        assert!(p.buffer_bytes() > p.used_bytes()); // orphans present
+
+        p.compact();
+
+        assert!(p.is_fixed_length());
+        assert_eq!(p.buffer_bytes(), p.used_bytes());
+        assert_eq!(p.buffer_bytes(), 6); // 2 entries × 3 visible bytes
+        assert_eq!(p.get(0), BStr::new("ORL"));
+        assert_eq!(p.get(1), BStr::new("UST"));
+    }
+
+    #[test]
+    fn compact_variable_reclaims_and_preserves_contents() {
+        let mut bld = StringPodBuilder::with_capacity(0, 3);
+        bld.push(b("AAAA")); // 4
+        bld.push(b("BBBBBB")); // 6
+        bld.push(b("CC")); // 2
+        let mut p = bld.finish().max_len(3, None); // "AAA" / "BBB" / "CC", orphans remain
+        p.drain(0..1); // drop "AAA"
+        assert_eq!(p.len(), 2);
+        assert!(p.buffer_bytes() > p.used_bytes());
+
+        p.compact();
+
+        assert!(!p.is_fixed_length());
+        assert_eq!(p.buffer_bytes(), p.used_bytes());
+        assert_eq!(p.buffer_bytes(), 5); // "BBB" + "CC"
+        assert_eq!(p.get(0), BStr::new("BBB"));
+        assert_eq!(p.get(1), BStr::new("CC"));
+    }
+
+    #[test]
+    fn compact_clones_a_shared_buffer() {
+        let mut bld = StringPodBuilder::with_capacity(3, 2);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        let original = bld.finish();
+        let mut view = original.slice(1..2); // shares the Arc, only "BBB" visible
+
+        view.compact();
+
+        // The shared original is untouched; the compacted view owns tight bytes.
+        assert_eq!(original.len(), 2);
+        assert_eq!(original.buffer_bytes(), 6);
+        assert_eq!(view.buffer_bytes(), 3);
+        assert_eq!(view.get(0), BStr::new("BBB"));
+    }
+
+    #[test]
+    fn compact_empty_is_a_noop_sized_buffer() {
+        let p_empty = StringPod::empty();
+        let mut p = p_empty;
+        p.compact();
+        assert_eq!(p.len(), 0);
+        assert_eq!(p.buffer_bytes(), 0);
     }
 
     // ── reverse ───────────────────────────────────────────────────────────
