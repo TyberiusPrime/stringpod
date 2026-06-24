@@ -49,10 +49,17 @@ impl StringPod {
     /// Ensure this pod owns its byte buffer outright, cloning it (COW) only if
     /// it is currently shared with another pod. After this call, mutating
     /// accessors such as [`get_mut`](Self::get_mut) always succeed.
+    ///
+    /// When the buffer is shared we have to clone it anyway, so we clone
+    /// **compacted**: [`compact`](Self::compact) allocates an exact-size buffer
+    /// and copies only the visible footprint, making the COW O(footprint) rather
+    /// than O(full backing buffer). Building many pods over one shared buffer and
+    /// mutating them therefore no longer amplifies to N × |buffer|. A
+    /// uniquely-owned buffer is left untouched (no copy, no compaction).
     pub fn make_exclusive(&mut self) {
-        // `Arc::make_mut` clones the buffer iff the strong count is > 1, then
-        // hands back a unique `&mut`. We only want the side effect.
-        let _ = Arc::make_mut(&mut self.data);
+        if Arc::get_mut(&mut self.data).is_none() {
+            self.compact();
+        }
     }
 
     /// An empty pod with no entries and an empty buffer.
@@ -416,6 +423,7 @@ impl StringPod {
     #[must_use]
     pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
         self.record_reverse(conditional);
+        self.make_exclusive(); // compacting COW when shared; no-op when already exclusive
         let data = Arc::make_mut(&mut self.data);
         let n = self.storage.len();
         for i in 0..n {
@@ -430,6 +438,7 @@ impl StringPod {
     /// Returns a mutable iterator over entries
     /// makes the buffer non-shared if shared
     pub fn iter_mut(&mut self) -> IterMut<'_> {
+        self.make_exclusive(); // compacting COW when shared; no-op when already exclusive
         let back = self.storage.len();
         // Disjoint fields: `data` borrowed mutably for the iterator, `storage`
         // immutably to drive the entry ranges.
@@ -1607,6 +1616,59 @@ mod tests {
         assert_eq!(original.buffer_bytes(), 6);
         assert_eq!(view.buffer_bytes(), 3);
         assert_eq!(view.get(0), BStr::new("BBB"));
+    }
+
+    #[test]
+    fn mutating_many_slices_of_one_buffer_does_not_amplify() {
+        // Build one buffer, slice N descendants over it (sharing the Arc), then
+        // mutate every descendant. Each must COW only its own footprint, so the
+        // total stays one buffer's worth instead of N × |buffer|.
+        let mut bld = StringPodBuilder::with_capacity(4, 8);
+        for i in 0..8u8 {
+            bld.push(&[b'A' + i, b'C', b'G', b'T']);
+        }
+        let original = bld.finish();
+        let full = original.buffer_bytes();
+        assert_eq!(full, 32);
+
+        let mut views: Vec<_> = (0..8).map(|i| original.slice(i..i + 1)).collect();
+        for v in &views {
+            assert_eq!(v.buffer_bytes(), full); // zero-copy slices share the buffer
+        }
+        for v in &mut views {
+            for e in v.iter_mut() {
+                e.make_ascii_lowercase();
+            }
+        }
+
+        let total: usize = views.iter().map(StringPod::buffer_bytes).sum();
+        assert_eq!(total, full); // 8 × 4 == 32, not 8 × 32
+        for (i, v) in views.iter().enumerate() {
+            assert_eq!(v.buffer_bytes(), 4);
+            assert_eq!(
+                v.get(0),
+                BStr::new(&[b'a' + u8::try_from(i).unwrap(), b'c', b'g', b't'])
+            );
+        }
+        assert_eq!(original.buffer_bytes(), full); // shared source untouched
+        assert_eq!(original.get(0), BStr::new("ACGT"));
+    }
+
+    #[test]
+    fn make_exclusive_leaves_an_owned_pod_uncompacted() {
+        // When the pod already owns its buffer, `make_exclusive` neither copies
+        // nor compacts — orphans from prior index-only edits stay resident.
+        let mut bld = StringPodBuilder::with_capacity(4, 2);
+        bld.push(b("ACGT"));
+        bld.push(b("TTGA"));
+        let mut p = bld.finish().max_len(2, None); // index-only clip → orphans
+        assert!(p.buffer_bytes() > p.used_bytes());
+        let before = p.buffer_bytes();
+
+        p.make_exclusive();
+
+        assert_eq!(p.buffer_bytes(), before); // untouched: no compaction
+        assert!(p.buffer_bytes() > p.used_bytes());
     }
 
     #[test]

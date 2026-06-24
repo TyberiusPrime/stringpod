@@ -35,9 +35,18 @@ A direct consequence: index-only alterations never reclaim space. Truncated
 tails, dropped entries and sliced-away regions stay resident in the buffer as
 unreferenced bytes (`used_bytes()` shrinks; `buffer_bytes()` does not).
 **Compaction is an explicit, separate, user-level step**, orthogonal to the
-alterations themselves. Operations never compact behind your back, so their cost
-stays predictable; call `compact()` when, and only when, reclamation actually
-matters to you.
+alterations themselves. *Index-only alterations* never compact behind your back,
+so their cost stays predictable; call `compact()` when, and only when,
+reclamation actually matters to you.
+
+The one place compaction happens implicitly is the copy in copy-on-write. When
+you mutate a pod whose buffer is **shared** with another pod, the buffer must be
+cloned anyway — so it is cloned *compacted* (exact-size, footprint-only) rather
+than duplicated whole. This costs no extra pass (you were already paying for the
+clone) and it is what keeps the common "build N pods over one buffer, then mutate
+all of them" pattern from amplifying to N × |buffer|: each descendant ends up
+owning just its own bytes. A pod that already owns its buffer is never touched —
+mutation of an exclusive pod stays in place, orphans and all.
 
 `pod.compact()` moves every entry's visible bytes into a fresh, exactly-sized
 buffer (one allocation per column — `seq` and `qual` for a `DualStringPod`),

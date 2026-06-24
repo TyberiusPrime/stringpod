@@ -221,15 +221,29 @@ impl DualStringPod {
         let _ = Arc::make_mut(&mut self.qual);
     }
 
-    /// Ensure this pod owns both byte buffers outright, cloning each (COW) only
-    /// if it is currently shared with another pod. After this call, mutating
+    /// Ensure this pod owns both byte buffers outright, cloning them (COW) only
+    /// if either is currently shared with another pod. After this call, mutating
     /// accessors such as [`seq_mut`](Self::seq_mut) / [`iter_mut`](Self::iter_mut)
-    /// always succeed. Equivalent to calling both
-    /// [`make_seq_exclusive`](Self::make_seq_exclusive) and
-    /// [`make_qual_exclusive`](Self::make_qual_exclusive).
+    /// always succeed.
+    ///
+    /// seq and qual share one coordinate index, so a single column can never be
+    /// compacted alone — exclusivity here is intrinsically whole-pod. When either
+    /// buffer is shared we must clone anyway, so we clone **compacted**:
+    /// [`compact`](Self::compact) allocates exact-size buffers, copies only the
+    /// visible footprint, and re-aligns both `first_byte`s to 0. That makes the
+    /// COW O(footprint) instead of O(full backing buffer) — building N pods over
+    /// one shared buffer and mutating all of them no longer amplifies to
+    /// N × |buffer|. A pod that already owns both buffers is left untouched
+    /// (no copy, no compaction), preserving the index-only laziness for the
+    /// read-only and already-exclusive cases.
+    ///
+    /// (The single-column [`make_seq_exclusive`](Self::make_seq_exclusive) /
+    /// [`make_qual_exclusive`](Self::make_qual_exclusive) cannot compact — the
+    /// shared index forbids it — so they remain plain full-buffer COWs.)
     pub fn make_exclusive(&mut self) {
-        self.make_seq_exclusive();
-        self.make_qual_exclusive();
+        if Arc::get_mut(&mut self.seq).is_none() || Arc::get_mut(&mut self.qual).is_none() {
+            self.compact();
+        }
     }
 
     #[must_use]
@@ -767,6 +781,7 @@ impl DualStringPod {
     #[must_use]
     pub fn reverse(mut self, conditional: Option<&[bool]>) -> Self {
         self.record_reverse(conditional);
+        self.make_exclusive(); // compacting COW when shared; no-op when already exclusive
         let seq_first_byte = self.seq_first_byte;
         let qual_first_byte = self.qual_first_byte;
         let n = self.storage.len();
@@ -788,6 +803,7 @@ impl DualStringPod {
     /// reachable as `(&mut pod).into_iter()`.
     #[must_use]
     pub fn iter_mut(&mut self) -> DualIterMut<'_> {
+        self.make_exclusive(); // compacting COW when shared; no-op when already exclusive
         let back = self.storage.len();
         let seq_first_byte = self.seq_first_byte;
         let qual_first_byte = self.qual_first_byte;
@@ -1638,6 +1654,68 @@ mod tests {
         assert_eq!(view.buffer_bytes(), 3);
         assert_eq!(view.seq(0), BStr::new("BBB"));
         assert_eq!(view.qual(0), BStr::new("yyy"));
+    }
+
+    #[test]
+    fn mutating_many_slices_of_one_buffer_does_not_amplify() {
+        // The consumer's shape: build one buffer, slice N descendants over it
+        // (all sharing both Arcs), then mutate every descendant. Each mutation
+        // must clone only its own footprint, not the whole backing buffer —
+        // otherwise total bytes blow up to N × |buffer|.
+        let mut bld = DualStringPodBuilder::with_capacity(4, 8);
+        for i in 0..8u8 {
+            bld.push(&[b'A' + i, b'C', b'G', b'T'], b"IIII");
+        }
+        let original = bld.finish();
+        let full = original.buffer_bytes(); // 32 bytes per column
+        assert_eq!(full, 32);
+
+        // One descendant per row; each addresses just 4 bytes of the 32.
+        let mut views: Vec<_> = (0..8).map(|i| original.slice(i..i + 1)).collect();
+        for v in &mut views {
+            // Still sharing the big buffer before mutation (zero-copy slices).
+            assert_eq!(v.buffer_bytes(), full);
+        }
+
+        // Mutate every descendant — the usual case. Each COWs compacted.
+        for v in &mut views {
+            for e in &mut *v {
+                e.seq.make_ascii_lowercase();
+            }
+        }
+
+        // No amplification: each descendant now owns exactly its 4 bytes, and
+        // the grand total equals one buffer's worth — not N × |buffer|.
+        let total: usize = views.iter().map(DualStringPod::buffer_bytes).sum();
+        assert_eq!(total, full); // 8 × 4 == 32, not 8 × 32
+        for (i, v) in views.iter().enumerate() {
+            assert_eq!(v.buffer_bytes(), 4);
+            assert_eq!(v.used_bytes(), 4);
+            let s = [b'a' + u8::try_from(i).unwrap(), b'c', b'g', b't'];
+            assert_eq!(v.seq(0), BStr::new(&s));
+        }
+        // The shared original was never disturbed.
+        assert_eq!(original.buffer_bytes(), full);
+        assert_eq!(original.seq(0), BStr::new("ACGT"));
+    }
+
+    #[test]
+    fn make_exclusive_leaves_an_owned_pod_uncompacted() {
+        // The laziness guarantee: when a pod already owns its buffers,
+        // `make_exclusive` neither copies nor compacts — orphans from prior
+        // index-only edits stay put (no compaction behind your back).
+        let mut bld = DualStringPodBuilder::with_capacity(4, 2);
+        bld.push(b("ACGT"), b("IIII"));
+        bld.push(b("TTGA"), b("FFFF"));
+        let mut p = bld.finish();
+        p.max_len(2, None); // index-only clip → orphans, unique buffer
+        assert!(p.buffer_bytes() > p.used_bytes());
+        let before = p.buffer_bytes();
+
+        p.make_exclusive();
+
+        assert_eq!(p.buffer_bytes(), before); // untouched: no compaction
+        assert!(p.buffer_bytes() > p.used_bytes());
     }
 
     #[test]
