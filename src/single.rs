@@ -412,6 +412,24 @@ impl StringPod {
             positions: Vec::new(),
         }
     }
+
+    /// A pod over live entries `range`, sharing this pod's byte buffer — no bytes
+    /// are copied. `FixedLength` stays `FixedLength` (O(1)); `Variable` copies
+    /// only the range's positions (O(range)). The result reads byte-identical to
+    /// `iter().skip(range.start).take(range.len())` and carries those entries'
+    /// edit history.
+    ///
+    /// # Panics
+    /// If `range.start > range.end` or `range.end > self.len()`.
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> StringPod {
+        let edits = self.edits.slice(range.clone());
+        StringPod {
+            data: Arc::clone(&self.data),
+            storage: self.storage.slice(range),
+            edits,
+        }
+    }
 }
 
 impl<'a> IntoIterator for &'a mut StringPod {
@@ -608,6 +626,106 @@ impl StringPodBuilder {
         let stop = u32::try_from(start_usize + bytes.len()).expect("byte buffer exceeds u32::MAX");
         self.data.extend_from_slice(bytes);
         self.storage.builder_push_position(start, stop);
+    }
+
+    /// Append entries `range` from a finished [`StringPod`] *en bloc*.
+    ///
+    /// This is the bulk equivalent of calling [`push`](Self::push) once per
+    /// entry, but instead of recomputing a range and doing a tiny `memcpy` per
+    /// entry it copies the whole contiguous source span in one shot. When the
+    /// source entries are contiguous in their buffer (the common
+    /// freshly-built case) this collapses `n` small copies into one `memcpy`.
+    ///
+    /// A `FixedLength` source is appended as a single strided `memcpy` with no
+    /// per-entry metadata at all, and the destination *stays* `FixedLength`
+    /// when its layout matches — or, if the builder is still empty, it adopts
+    /// the source's stride and cut overlay. Fixed-length reads are the common
+    /// case, so this keeps the produced column fixed-length (and its downstream
+    /// cuts O(1)) instead of needlessly promoting to `Variable`.
+    ///
+    /// Otherwise it falls back to copying the visible span and recording one
+    /// position per entry (promoting to `Variable`). Any bytes hidden by the
+    /// source's per-entry cut overlay (e.g. a stripped leading `@`) ride along
+    /// in the copied span but stay hidden.
+    ///
+    /// # Panics
+    /// If `range.end > src.len()` or the byte buffer would exceed `u32::MAX`.
+    pub fn extend_from_pod(&mut self, src: &StringPod, range: Range<usize>) {
+        assert!(range.end <= src.len(), "range past end of source pod");
+        if range.start >= range.end {
+            return;
+        }
+        let n = range.end - range.start;
+
+        // Fast path: a FixedLength source appends as one strided memcpy and the
+        // destination keeps a fixed layout (matching, or empty → adopt).
+        if let Storage::FixedLength {
+            stride,
+            head_skip,
+            visible_len,
+            front_byte,
+            ..
+        } = src.storage
+        {
+            let dest_empty = self.storage.is_empty() && self.data.is_empty();
+            let compatible = match &self.storage {
+                Storage::FixedLength {
+                    stride: ds,
+                    head_skip: dh,
+                    visible_len: dv,
+                    ..
+                } => *ds == stride && *dh == head_skip && *dv == visible_len,
+                Storage::Variable(_) => dest_empty,
+            };
+            if compatible {
+                let s = stride as usize;
+                let raw_lo = front_byte as usize + range.start * s;
+                let raw_hi = front_byte as usize + range.end * s;
+                self.data.extend_from_slice(&src.data[raw_lo..raw_hi]);
+                let added = u32::try_from(n).expect("entry count exceeds u32::MAX");
+                match &mut self.storage {
+                    Storage::FixedLength { count, .. } => {
+                        *count = count
+                            .checked_add(added)
+                            .expect("StringPod count exceeded u32::MAX");
+                    }
+                    // Empty builder: adopt the source's stride + cut overlay.
+                    Storage::Variable(_) => {
+                        self.storage = Storage::FixedLength {
+                            stride,
+                            head_skip,
+                            visible_len,
+                            count: added,
+                            front_byte: 0,
+                        };
+                    }
+                }
+                return;
+            }
+        }
+
+        // General path: one memcpy of the visible span, one position per entry.
+        // Entries are ascending and non-overlapping, so [first.start, last.end)
+        // spans the whole run (plus any interior cut gaps, which stay hidden).
+        let span_start = src.storage.entry_range(range.start).start;
+        let span_end = src.storage.entry_range(range.end - 1).end;
+        let dest_base = self.data.len();
+        self.data.extend_from_slice(&src.data[span_start..span_end]);
+
+        self.storage.promote_to_variable();
+        let Storage::Variable(info) = &mut self.storage else {
+            unreachable!("just promoted to Variable")
+        };
+        info.positions.reserve(n);
+        for i in range {
+            let r = src.storage.entry_range(i);
+            // A source offset `p` was copied to `p - span_start + dest_base`.
+            let start = u32::try_from(r.start - span_start + dest_base)
+                .expect("byte buffer exceeds u32::MAX");
+            let stop = u32::try_from(r.end - span_start + dest_base)
+                .expect("byte buffer exceeds u32::MAX");
+            info.positions.push((start, stop));
+        }
     }
 
     /// Number of entries pushed so far.
@@ -1098,6 +1216,112 @@ mod tests {
         assert_eq!(source.get(0), BStr::new("DE"));
         // Alias still sees the full original
         assert_eq!(aliased.get(0), BStr::new("ABCDEFGH"));
+    }
+
+    // ── slice ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn slice_fixed_stays_fixed_and_shares_buffer() {
+        let mut bld = StringPodBuilder::with_capacity(3, 4);
+        bld.push(b("AAA"));
+        bld.push(b("BBB"));
+        bld.push(b("CCC"));
+        bld.push(b("DDD"));
+        let p = bld.finish();
+        let s = p.slice(1..3);
+        assert!(s.is_fixed_length());
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.get(0), BStr::new("BBB"));
+        assert_eq!(s.get(1), BStr::new("CCC"));
+        // No bytes copied: same underlying Arc buffer.
+        assert!(std::ptr::eq(p.data.as_ref(), s.data.as_ref()));
+        // Original untouched.
+        assert_eq!(p.len(), 4);
+    }
+
+    #[test]
+    fn slice_variable_matches_skip_take() {
+        let mut bld = StringPodBuilder::with_capacity(0, 4);
+        bld.push(b("hello"));
+        bld.push(b("hi"));
+        bld.push(b("foobar"));
+        bld.push(b("x"));
+        let p = bld.finish();
+        for start in 0..=p.len() {
+            for end in start..=p.len() {
+                let s = p.slice(start..end);
+                let want: Vec<&BStr> = p.iter().skip(start).take(end - start).collect();
+                let got: Vec<&BStr> = s.iter().collect();
+                assert_eq!(got, want, "slice {start}..{end}");
+                assert!(std::ptr::eq(p.data.as_ref(), s.data.as_ref()));
+            }
+        }
+    }
+
+    #[test]
+    fn slice_preserves_cut_overlay_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"));
+        bld.push(b("WORLD"));
+        bld.push(b("RUSTY"));
+        let mut p = bld.finish();
+        p.cut_start(1, None);
+        p.cut_end(1, None);
+        let s = p.slice(1..3);
+        assert!(s.is_fixed_length());
+        assert_eq!(s.get(0), BStr::new("ORL"));
+        assert_eq!(s.get(1), BStr::new("UST"));
+    }
+
+    #[test]
+    fn slice_under_pop_front_fixed() {
+        let mut bld = StringPodBuilder::with_capacity(2, 4);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        bld.push(b("CC"));
+        bld.push(b("DD"));
+        let mut p = bld.finish();
+        p.pop_front(1); // live view: BB CC DD
+        let s = p.slice(0..2);
+        assert_eq!(s.get(0), BStr::new("BB"));
+        assert_eq!(s.get(1), BStr::new("CC"));
+    }
+
+    #[test]
+    fn slice_variable_under_overlays() {
+        let mut bld = StringPodBuilder::with_capacity(0, 4);
+        bld.push(b("alpha"));
+        bld.push(b("beta"));
+        bld.push(b("gamma"));
+        bld.push(b("delta"));
+        let mut p = bld.finish();
+        p.cut_start(1, None); // promotes nothing; already variable
+        p.pop_front(1); // live: eta amma elta (after cut_start)
+        let s = p.slice(1..3);
+        let want: Vec<&BStr> = p.iter().skip(1).take(2).collect();
+        let got: Vec<&BStr> = s.iter().collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn slice_empty_range() {
+        let mut bld = StringPodBuilder::with_capacity(2, 2);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        let p = bld.finish();
+        let s = p.slice(1..1);
+        assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "slice range past end")]
+    fn slice_out_of_bounds_panics() {
+        let mut bld = StringPodBuilder::with_capacity(2, 2);
+        bld.push(b("AA"));
+        bld.push(b("BB"));
+        let p = bld.finish();
+        let _ = p.slice(1..5);
     }
 
     #[test]
@@ -1762,5 +1986,173 @@ mod tests {
         for astring in &p2 {
             assert!(astring.is_empty());
         }
+    }
+
+    // ── extend_from_pod (en-bloc range append) ──────────────────────────────
+
+    fn pod(entries: &[&str]) -> StringPod {
+        let mut bld = StringPodBuilder::with_capacity(0, entries.len());
+        for e in entries {
+            bld.push(b(e));
+        }
+        bld.finish()
+    }
+
+    #[test]
+    fn extend_from_pod_full_range_variable() {
+        let src = pod(&["hello", "hi", "foobar"]);
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 0..src.len());
+        let p = bld.finish();
+        let got: Vec<&BStr> = p.iter().collect();
+        assert_eq!(
+            got,
+            vec![BStr::new("hello"), BStr::new("hi"), BStr::new("foobar")]
+        );
+    }
+
+    #[test]
+    fn extend_from_pod_partial_range() {
+        let src = pod(&["AA", "BB", "CC", "DD", "EE"]);
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 1..4); // BB CC DD
+        let p = bld.finish();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.get(0), BStr::new("BB"));
+        assert_eq!(p.get(1), BStr::new("CC"));
+        assert_eq!(p.get(2), BStr::new("DD"));
+    }
+
+    #[test]
+    fn extend_from_pod_concatenates_multiple_sources() {
+        let a = pod(&["a1", "a2"]);
+        let b_ = pod(&["b1", "b2", "b3"]);
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&a, 0..2);
+        bld.extend_from_pod(&b_, 1..3); // b2 b3
+        let p = bld.finish();
+        let got: Vec<String> = p.iter().map(ToString::to_string).collect();
+        assert_eq!(got, vec!["a1", "a2", "b2", "b3"]);
+    }
+
+    #[test]
+    fn extend_from_pod_fixed_length_source_stays_fixed() {
+        // Fixed-length source: span is one contiguous strided memcpy and the
+        // empty destination adopts the source's stride, staying FixedLength.
+        let mut sb = StringPodBuilder::with_capacity(3, 3);
+        sb.push(b("AAA"));
+        sb.push(b("BBB"));
+        sb.push(b("CCC"));
+        let src = sb.finish();
+        assert!(src.is_fixed_length());
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 0..3);
+        let p = bld.finish();
+        assert!(p.is_fixed_length(), "destination should stay fixed-length");
+        assert_eq!(p.get(0), BStr::new("AAA"));
+        assert_eq!(p.get(2), BStr::new("CCC"));
+    }
+
+    #[test]
+    fn extend_from_pod_two_matching_fixed_sources_stay_fixed() {
+        let mut a = StringPodBuilder::with_capacity(2, 2);
+        a.push(b("AA"));
+        a.push(b("BB"));
+        let a = a.finish();
+        let mut b2 = StringPodBuilder::with_capacity(2, 2);
+        b2.push(b("CC"));
+        b2.push(b("DD"));
+        let b2 = b2.finish();
+
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&a, 0..2);
+        bld.extend_from_pod(&b2, 0..2);
+        let p = bld.finish();
+        assert!(p.is_fixed_length());
+        let got: Vec<String> = p.iter().map(ToString::to_string).collect();
+        assert_eq!(got, vec!["AA", "BB", "CC", "DD"]);
+    }
+
+    #[test]
+    fn extend_from_pod_mismatched_stride_promotes_to_variable() {
+        let mut a = StringPodBuilder::with_capacity(2, 2);
+        a.push(b("AA"));
+        a.push(b("BB"));
+        let a = a.finish();
+        let mut b3 = StringPodBuilder::with_capacity(3, 1);
+        b3.push(b("CCC"));
+        let b3 = b3.finish();
+
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&a, 0..2); // adopts stride 2, fixed
+        bld.extend_from_pod(&b3, 0..1); // stride mismatch → promote
+        let p = bld.finish();
+        assert!(!p.is_fixed_length());
+        let got: Vec<String> = p.iter().map(ToString::to_string).collect();
+        assert_eq!(got, vec!["AA", "BB", "CCC"]);
+    }
+
+    #[test]
+    fn extend_from_pod_fixed_source_partial_range_with_cut() {
+        // Fixed source carrying a cut overlay (like a stripped '@'): the fast
+        // path must preserve the overlay through the strided copy.
+        let mut sb = StringPodBuilder::with_capacity(4, 3);
+        sb.push(b("@abc"));
+        sb.push(b("@def"));
+        sb.push(b("@ghi"));
+        let mut src = sb.finish();
+        src.cut_start(1, None); // visible: "abc", "def", "ghi"
+        assert!(src.is_fixed_length());
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 1..3); // def ghi
+        let p = bld.finish();
+        assert!(p.is_fixed_length());
+        assert_eq!(p.get(0), BStr::new("def"));
+        assert_eq!(p.get(1), BStr::new("ghi"));
+    }
+
+    #[test]
+    fn extend_from_pod_respects_cut_overlay() {
+        // A leading-byte cut (like the '@' strip on FASTQ names): the hidden
+        // byte rides along in the copied span but must stay hidden.
+        let mut sb = StringPodBuilder::with_capacity(4, 2);
+        sb.push(b("@abc"));
+        sb.push(b("@xyz"));
+        let mut src = sb.finish();
+        src.cut_start(1, None); // visible: "abc", "xyz"
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 0..2);
+        let p = bld.finish();
+        assert_eq!(p.get(0), BStr::new("abc"));
+        assert_eq!(p.get(1), BStr::new("xyz"));
+    }
+
+    #[test]
+    fn extend_from_pod_after_pop_front() {
+        let src = pod(&["AAAAA", "BBB", "CCCCC"]);
+        let mut src = src;
+        src.pop_front(1); // view: "BBB", "CCCCC"
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 0..src.len());
+        let p = bld.finish();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.get(0), BStr::new("BBB"));
+        assert_eq!(p.get(1), BStr::new("CCCCC"));
+    }
+
+    #[test]
+    fn extend_from_pod_empty_range_is_noop() {
+        let src = pod(&["AA", "BB"]);
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 1..1);
+        assert_eq!(bld.finish().len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "range past end of source pod")]
+    fn extend_from_pod_out_of_range_panics() {
+        let src = pod(&["AA", "BB"]);
+        let mut bld = StringPodBuilder::new();
+        bld.extend_from_pod(&src, 0..3);
     }
 }

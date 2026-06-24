@@ -353,6 +353,58 @@ impl Storage {
         }
     }
 
+    /// A copy of this storage restricted to live entries `range`, sharing the
+    /// same byte buffer(s) as the source (slicing touches no bytes).
+    ///
+    /// `FixedLength` stays `FixedLength` (O(1)): the front byte is advanced past
+    /// the dropped leading entries and the count narrowed, preserving the
+    /// stride/cut overlay so downstream cuts stay O(1). `Variable` copies only
+    /// the `positions` for the range (O(range), no bytes), keeping the per-entry
+    /// cut overlay.
+    ///
+    /// # Panics
+    /// If `range.start > range.end` or `range.end > self.len()`.
+    pub(crate) fn slice(&self, range: Range<usize>) -> Storage {
+        assert!(range.start <= range.end, "slice range start > end");
+        assert!(range.end <= self.len(), "slice range past end of storage");
+        let n = u32::try_from(range.end - range.start).expect("slice length exceeds u32::MAX");
+        match *self {
+            Storage::FixedLength {
+                stride,
+                head_skip,
+                visible_len,
+                front_byte,
+                ..
+            } => {
+                let advance = (range.start as u64).wrapping_mul(u64::from(stride));
+                let front_byte =
+                    u32::try_from(u64::from(front_byte).wrapping_add(advance)).unwrap_or(u32::MAX);
+                Storage::FixedLength {
+                    stride,
+                    head_skip,
+                    visible_len,
+                    count: n,
+                    front_byte,
+                }
+            }
+            Storage::Variable(VariableInfo {
+                ref positions,
+                head_skip,
+                tail_skip,
+                front_skip,
+            }) => {
+                let base = front_skip as usize;
+                let positions = positions[base + range.start..base + range.end].to_vec();
+                Storage::Variable(VariableInfo {
+                    positions,
+                    head_skip,
+                    tail_skip,
+                    front_skip: 0,
+                })
+            }
+        }
+    }
+
     /// Sum of visible bytes across all live entries.
     pub(crate) fn used_bytes(&self) -> usize {
         match *self {

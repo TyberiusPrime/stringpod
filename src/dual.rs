@@ -146,14 +146,16 @@ impl DualStringPod {
                     // Entry 0 is now relative to each column's own first byte.
                     front_byte: 0,
                 };
-                return Ok(DualStringPod {
+                let fused = DualStringPod {
                     seq: seq.data,
                     qual: qual.data,
                     storage,
                     seq_first_byte: *seq_front_byte as usize,
                     qual_first_byte: *qual_front_byte as usize,
                     edits: ColumnEdits::new(count),
-                });
+                };
+                fused.debug_assert_within_buffers();
+                return Ok(fused);
             }
         }
 
@@ -190,14 +192,16 @@ impl DualStringPod {
             tail_skip: 0,
             front_skip: 0,
         });
-        Ok(DualStringPod {
+        let fused = DualStringPod {
             seq: seq.data,
             qual: qual.data,
             storage,
             seq_first_byte: base_seq,
             qual_first_byte: base_qual,
             edits: ColumnEdits::new(count),
-        })
+        };
+        fused.debug_assert_within_buffers();
+        Ok(fused)
     }
 
     /// Ensure this pod owns its **seq** buffer outright, cloning it (COW) only
@@ -315,6 +319,34 @@ impl DualStringPod {
     #[must_use]
     pub fn entry_len(&self, i: usize) -> usize {
         self.storage.entry_len(i)
+    }
+
+    /// Contract check: every live entry's byte range, once the per-column
+    /// first-byte offset is added, must lie inside that column's buffer.
+    /// Violations mean the storage metadata and the `*_first_byte` offsets have
+    /// drifted out of sync with the buffers (e.g. a rebuild that swapped the
+    /// buffers but kept stale offsets). Debug-only — `O(len)`, no-op in release.
+    #[inline]
+    fn debug_assert_within_buffers(&self) {
+        if cfg!(debug_assertions) {
+            for i in 0..self.storage.len() {
+                let r = self.storage.entry_range(i);
+                debug_assert!(
+                    r.end + self.seq_first_byte <= self.seq.len(),
+                    "seq entry {i} range {r:?}+{} exceeds seq buffer {} (storage {:?})",
+                    self.seq_first_byte,
+                    self.seq.len(),
+                    self.storage,
+                );
+                debug_assert!(
+                    r.end + self.qual_first_byte <= self.qual.len(),
+                    "qual entry {i} range {r:?}+{} exceeds qual buffer {} (storage {:?})",
+                    self.qual_first_byte,
+                    self.qual.len(),
+                    self.storage,
+                );
+            }
+        }
     }
 
     #[must_use]
@@ -620,8 +652,14 @@ impl DualStringPod {
             self.seq = temp.seq;
             self.qual = temp.qual;
             self.storage = temp.storage;
+            // The rebuilt pod owns fresh, compact buffers whose entry 0 starts at
+            // each column's own first byte — adopt its offsets, or the stale ones
+            // from the pre-rebuild layout would index past the new buffers.
+            self.seq_first_byte = temp.seq_first_byte;
+            self.qual_first_byte = temp.qual_first_byte;
         }
         self.record_windows(&windows);
+        self.debug_assert_within_buffers();
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
@@ -657,6 +695,7 @@ impl DualStringPod {
             kept
         });
         self.record_windows(&windows);
+        self.debug_assert_within_buffers();
     }
 
     pub fn retain_by_bools(&mut self, keep: &[bool]) {
@@ -769,6 +808,30 @@ impl DualStringPod {
             next: 0,
             positions: Vec::new(),
         }
+    }
+
+    /// A pod over live entries `range`, sharing both byte buffers and the single
+    /// shared metadata column — no bytes are copied. `FixedLength` stays
+    /// `FixedLength` (O(1)); `Variable` copies only the range's positions
+    /// (O(range)). The result reads byte-identical to
+    /// `iter().skip(range.start).take(range.len())` and carries those entries'
+    /// edit history. The per-column first-byte offsets are preserved.
+    ///
+    /// # Panics
+    /// If `range.start > range.end` or `range.end > self.len()`.
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> DualStringPod {
+        let edits = self.edits.slice(range.clone());
+        let sliced = DualStringPod {
+            seq: Arc::clone(&self.seq),
+            qual: Arc::clone(&self.qual),
+            storage: self.storage.slice(range),
+            seq_first_byte: self.seq_first_byte,
+            qual_first_byte: self.qual_first_byte,
+            edits,
+        };
+        sliced.debug_assert_within_buffers();
+        sliced
     }
 }
 
@@ -1100,6 +1163,113 @@ impl DualStringPodBuilder {
         self.storage.builder_push_position(start, stop);
     }
 
+    /// Append entries `range` from a finished [`DualStringPod`] *en bloc*.
+    ///
+    /// The bulk equivalent of calling [`push`](Self::push) once per entry: both
+    /// the seq and qual visible spans are copied with a single
+    /// `extend_from_slice` apiece, then one shared position is recorded per
+    /// entry. For contiguous source entries (the common freshly-built case)
+    /// this collapses `n` per-column copies into one `memcpy` per column.
+    ///
+    /// A `FixedLength` source is appended as one strided `memcpy` per column
+    /// with no per-entry metadata, and the destination *stays* `FixedLength`
+    /// when its layout matches — or, if the builder is still empty, it adopts
+    /// the source's stride and cut overlay. Fixed-length reads (uniform read
+    /// length) are the common case, so this keeps the produced column
+    /// fixed-length instead of needlessly promoting to `Variable`.
+    ///
+    /// Otherwise it falls back to copying the visible span and recording one
+    /// shared position per entry. Any bytes hidden by the source's per-entry
+    /// cut overlay ride along in the copied span but stay hidden.
+    ///
+    /// # Panics
+    /// If `range.end > src.len()` or either byte buffer would exceed
+    /// `u32::MAX`.
+    pub fn extend_from_pod(&mut self, src: &DualStringPod, range: Range<usize>) {
+        assert!(range.end <= src.len(), "range past end of source pod");
+        if range.start >= range.end {
+            return;
+        }
+        let n = range.end - range.start;
+        let (sf, qf) = (src.seq_first_byte, src.qual_first_byte);
+
+        // Fast path: a FixedLength source appends as one strided memcpy per
+        // column and the destination keeps a fixed layout (matching, or empty
+        // → adopt).
+        if let Storage::FixedLength {
+            stride,
+            head_skip,
+            visible_len,
+            front_byte,
+            ..
+        } = src.storage
+        {
+            let dest_empty = self.storage.is_empty() && self.seq.is_empty();
+            let compatible = match &self.storage {
+                Storage::FixedLength {
+                    stride: ds,
+                    head_skip: dh,
+                    visible_len: dv,
+                    ..
+                } => *ds == stride && *dh == head_skip && *dv == visible_len,
+                Storage::Variable(_) => dest_empty,
+            };
+            if compatible {
+                let s = stride as usize;
+                let raw_lo = front_byte as usize + range.start * s;
+                let raw_hi = front_byte as usize + range.end * s;
+                self.seq
+                    .extend_from_slice(&src.seq[raw_lo + sf..raw_hi + sf]);
+                self.qual
+                    .extend_from_slice(&src.qual[raw_lo + qf..raw_hi + qf]);
+                let added = u32::try_from(n).expect("entry count exceeds u32::MAX");
+                match &mut self.storage {
+                    Storage::FixedLength { count, .. } => {
+                        *count = count
+                            .checked_add(added)
+                            .expect("DualStringPod count exceeded u32::MAX");
+                    }
+                    Storage::Variable(_) => {
+                        self.storage = Storage::FixedLength {
+                            stride,
+                            head_skip,
+                            visible_len,
+                            count: added,
+                            front_byte: 0,
+                        };
+                    }
+                }
+                return;
+            }
+        }
+
+        // General path: one memcpy of the visible span per column, one shared
+        // position per entry. Storage coordinates are shared by seq & qual; add
+        // each buffer's own first-byte offset to reach the actual bytes.
+        let span_start = src.storage.entry_range(range.start).start;
+        let span_end = src.storage.entry_range(range.end - 1).end;
+        let dest_base = self.seq.len(); // == self.qual.len() (kept in lockstep)
+        self.seq
+            .extend_from_slice(&src.seq[span_start + sf..span_end + sf]);
+        self.qual
+            .extend_from_slice(&src.qual[span_start + qf..span_end + qf]);
+
+        self.storage.promote_to_variable();
+        let Storage::Variable(info) = &mut self.storage else {
+            unreachable!("just promoted to Variable")
+        };
+        info.positions.reserve(n);
+        for i in range {
+            let r = src.storage.entry_range(i);
+            // A source storage offset `p` was copied to `p - span_start + dest_base`.
+            let start = u32::try_from(r.start - span_start + dest_base)
+                .expect("byte buffer exceeds u32::MAX");
+            let stop = u32::try_from(r.end - span_start + dest_base)
+                .expect("byte buffer exceeds u32::MAX");
+            info.positions.push((start, stop));
+        }
+    }
+
     #[must_use]
     pub fn len(&self) -> usize {
         self.storage.len()
@@ -1231,6 +1401,123 @@ mod tests {
         assert_eq!(p.len(), 0);
         assert!(p.is_empty());
         assert_eq!(p.used_bytes(), 0);
+    }
+
+    #[test]
+    fn slice_dual_fixed_stays_fixed_and_shares_buffers() {
+        let mut bld = DualStringPodBuilder::with_capacity(3, 4);
+        bld.push(b("AAA"), b("###"));
+        bld.push(b("BBB"), b("$$$"));
+        bld.push(b("CCC"), b("%%%"));
+        bld.push(b("DDD"), b("&&&"));
+        let p = bld.finish();
+        let s = p.slice(1..3);
+        assert!(s.is_fixed_length());
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.seq(0), BStr::new("BBB"));
+        assert_eq!(s.qual(0), BStr::new("$$$"));
+        assert_eq!(s.seq(1), BStr::new("CCC"));
+        assert_eq!(s.qual(1), BStr::new("%%%"));
+        // No bytes copied: both Arcs shared with the source.
+        assert!(std::ptr::eq(p.seq.as_ref(), s.seq.as_ref()));
+        assert!(std::ptr::eq(p.qual.as_ref(), s.qual.as_ref()));
+    }
+
+    #[test]
+    fn slice_dual_variable_matches_skip_take() {
+        let mut bld = DualStringPodBuilder::with_capacity(0, 4);
+        bld.push(b("hello"), b("HELLO"));
+        bld.push(b("hi"), b("HI"));
+        bld.push(b("foobar"), b("FOOBAR"));
+        bld.push(b("x"), b("X"));
+        let p = bld.finish();
+        for start in 0..=p.len() {
+            for end in start..=p.len() {
+                let s = p.slice(start..end);
+                let want_seq: Vec<&BStr> = p.iter_seq().skip(start).take(end - start).collect();
+                let got_seq: Vec<&BStr> = s.iter_seq().collect();
+                assert_eq!(got_seq, want_seq, "slice {start}..{end} seq");
+                let want_qual: Vec<&BStr> = p.iter_qual().skip(start).take(end - start).collect();
+                let got_qual: Vec<&BStr> = s.iter_qual().collect();
+                assert_eq!(got_qual, want_qual, "slice {start}..{end} qual");
+            }
+        }
+    }
+
+    #[test]
+    fn slice_dual_from_columns_with_offset_then_cut_end() {
+        // Mirror the parser pipeline: fuse seq+qual via try_from_columns (which
+        // can carry a non-zero per-column first-byte), slice a sub-range (the
+        // combiner), then cut_end (a Truncate step), then read every entry.
+        use crate::StringPodBuilder;
+        let mut sb = StringPodBuilder::with_capacity(0, 5);
+        let mut qb = StringPodBuilder::with_capacity(0, 5);
+        for i in 0..5 {
+            sb.push(format!("SEQ{i:02}").as_bytes());
+            qb.push(format!("QAL{i:02}").as_bytes());
+        }
+        let mut seq = sb.finish();
+        let mut qual = qb.finish();
+        // Non-zero front offset on both columns (drops entry 0).
+        seq.pop_front(1);
+        qual.pop_front(1);
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
+        // dual now has 4 live entries: SEQ01..SEQ04
+        let s = dual.slice(1..3); // SEQ02, SEQ03
+        assert_eq!(s.seq(0), BStr::new("SEQ02"));
+        assert_eq!(s.qual(1), BStr::new("QAL03"));
+        let mut s = s;
+        s.cut_end(2, None); // Truncate to first 3 bytes
+        assert_eq!(s.seq(0), BStr::new("SEQ"));
+        assert_eq!(s.qual(1), BStr::new("QAL"));
+    }
+
+    #[test]
+    fn slice_dual_with_offset_then_max_len_rebuild() {
+        // Regression: the real demultiplex pipeline fuses seq+qual with a
+        // non-zero per-column first-byte, slices a sub-range (combiner), then
+        // runs Truncate -> `max_len`, whose non-conditional path *rebuilds* into
+        // fresh compact buffers. The rebuild must adopt the new buffers' own
+        // first-byte offsets; keeping the stale (150-style) offset made later
+        // `seq`/`qual` reads index past the compact buffer.
+        use crate::StringPodBuilder;
+        let mut sb = StringPodBuilder::with_capacity(0, 5);
+        let mut qb = StringPodBuilder::with_capacity(0, 5);
+        for i in 0..5 {
+            sb.push(format!("SEQ{i:02}").as_bytes());
+            qb.push(format!("QAL{i:02}").as_bytes());
+        }
+        let mut seq = sb.finish();
+        let mut qual = qb.finish();
+        // Non-zero front offset on both columns (drops entry 0): entry 0 now
+        // starts at byte 5 in each buffer, i.e. seq_first_byte == 5.
+        seq.pop_front(1);
+        qual.pop_front(1);
+        let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
+        let mut s = dual.slice(1..3); // SEQ02, SEQ03
+        // Truncate to first 3 bytes — exercises the rebuild path.
+        s.max_len(3, None);
+        assert_eq!(s.len(), 2);
+        assert_eq!(s.seq(0), BStr::new("SEQ"));
+        assert_eq!(s.qual(0), BStr::new("QAL"));
+        assert_eq!(s.seq(1), BStr::new("SEQ"));
+        assert_eq!(s.qual(1), BStr::new("QAL"));
+    }
+
+    #[test]
+    fn slice_dual_preserves_cut_overlay() {
+        let mut bld = DualStringPodBuilder::with_capacity(5, 3);
+        bld.push(b("HELLO"), b("12345"));
+        bld.push(b("WORLD"), b("67890"));
+        bld.push(b("RUSTY"), b("abcde"));
+        let mut p = bld.finish();
+        p.cut_start(1, None);
+        p.cut_end(1, None);
+        let s = p.slice(1..3);
+        assert_eq!(s.seq(0), BStr::new("ORL"));
+        assert_eq!(s.qual(0), BStr::new("789"));
+        assert_eq!(s.seq(1), BStr::new("UST"));
+        assert_eq!(s.qual(1), BStr::new("bcd"));
     }
 
     #[test]
@@ -2069,5 +2356,70 @@ mod tests {
         bld.push(b("ACGT"), b("FFFF"));
         let mut p = bld.finish();
         p.resize(|_, _, _| Some((1, 5))); // 1+5 > 4
+    }
+
+    // ── extend_from_pod (en-bloc range append) ──────────────────────────────
+
+    #[test]
+    fn extend_from_pod_dual_full_and_partial() {
+        let mut sb = DualStringPodBuilder::with_capacity(0, 3);
+        sb.push(b("ACGT"), b("FFFF"));
+        sb.push(b("TT"), b("##"));
+        sb.push(b("GGGGG"), b("IIIII"));
+        let src = sb.finish();
+
+        let mut bld = DualStringPodBuilder::with_capacity(0, 0);
+        bld.extend_from_pod(&src, 0..src.len());
+        let p = bld.finish();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.pair(0), (BStr::new("ACGT"), BStr::new("FFFF")));
+        assert_eq!(p.pair(1), (BStr::new("TT"), BStr::new("##")));
+        assert_eq!(p.pair(2), (BStr::new("GGGGG"), BStr::new("IIIII")));
+
+        let mut bld = DualStringPodBuilder::with_capacity(0, 0);
+        bld.extend_from_pod(&src, 1..3);
+        let p = bld.finish();
+        assert_eq!(p.len(), 2);
+        assert_eq!(p.pair(0), (BStr::new("TT"), BStr::new("##")));
+        assert_eq!(p.pair(1), (BStr::new("GGGGG"), BStr::new("IIIII")));
+    }
+
+    #[test]
+    fn extend_from_pod_dual_fixed_stays_fixed() {
+        let mut sb = DualStringPodBuilder::with_capacity(4, 3);
+        sb.push(b("ACGT"), b("FFFF"));
+        sb.push(b("TTTT"), b("####"));
+        sb.push(b("GGGG"), b("IIII"));
+        let src = sb.finish();
+        assert!(src.is_fixed_length());
+
+        let mut bld = DualStringPodBuilder::with_capacity(0, 0);
+        bld.extend_from_pod(&src, 0..2);
+        bld.extend_from_pod(&src, 2..3); // same stride continues fixed
+        let p = bld.finish();
+        assert!(p.is_fixed_length(), "destination should stay fixed-length");
+        assert_eq!(p.len(), 3);
+        assert_eq!(p.pair(0), (BStr::new("ACGT"), BStr::new("FFFF")));
+        assert_eq!(p.pair(2), (BStr::new("GGGG"), BStr::new("IIII")));
+    }
+
+    #[test]
+    fn extend_from_pod_dual_fixed_from_columns_offsets() {
+        // A dual pod fused via try_from_columns can carry non-zero per-buffer
+        // first_byte offsets; the strided fast path must honor them.
+        let mut s = crate::single::StringPodBuilder::with_capacity(3, 2);
+        s.push(b("ACG"));
+        s.push(b("TTT"));
+        let mut q = crate::single::StringPodBuilder::with_capacity(3, 2);
+        q.push(b("FFF"));
+        q.push(b("###"));
+        let src = DualStringPod::try_from_columns(s.finish(), q.finish()).unwrap();
+        assert!(src.is_fixed_length());
+
+        let mut bld = DualStringPodBuilder::with_capacity(0, 0);
+        bld.extend_from_pod(&src, 0..2);
+        let p = bld.finish();
+        assert_eq!(p.pair(0), (BStr::new("ACG"), BStr::new("FFF")));
+        assert_eq!(p.pair(1), (BStr::new("TTT"), BStr::new("###")));
     }
 }

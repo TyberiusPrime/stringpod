@@ -158,6 +158,25 @@ impl ColumnEdits {
         }
     }
 
+    /// A copy of this column's edit history restricted to live entries `range`,
+    /// in view order. Mirrors [`StringPod::slice`](crate::StringPod::slice): the
+    /// sliced column carries exactly the edits of the entries it keeps. Stays in
+    /// the cheap uniform state when the source is uniform.
+    ///
+    /// # Panics
+    /// If `range.start > range.end` or `range.end > self.len()`.
+    #[must_use]
+    pub fn slice(&self, range: Range<usize>) -> ColumnEdits {
+        assert!(range.start <= range.end, "slice range start > end");
+        assert!(range.end <= self.len, "slice range past end of column");
+        let len = range.end - range.start;
+        let inner = match &self.inner {
+            Inner::Uniform(log) => Inner::Uniform(log.clone()),
+            Inner::PerEntry(logs) => Inner::PerEntry(logs[range].to_vec()),
+        };
+        ColumnEdits { inner, len }
+    }
+
     // ── whole-row (entry-axis) operations ───────────────────────────────────
     //
     // These change *which* entries are live, not their coordinate frames, so
