@@ -21,6 +21,24 @@ Each type is built via an owning `*Builder` (pushes into a fresh `Vec<u8>`)
 or a `*AliasBuilder` (records sub-string ranges into a pod's buffer
 without copying, enabling COW semantics).
 
+## Guiding principle: index-only by default
+
+Alterations rewrite **metadata, not bytes**, whenever that can express the
+result. Narrowing, dropping, slicing, truncating, reordering — all are done by
+adjusting the columnar index (positions / overlays / counts) over a buffer that
+stays shared behind its `Arc`. The byte buffer is only cloned and written when
+an operation genuinely changes byte *content* or *grows* an entry — `prefix`,
+`postfix`, and the splice/write-back family — and even those clone the `Arc`
+lazily (COW) so untouched data is never copied.
+
+A direct consequence: index-only alterations never reclaim space. Truncated
+tails, dropped entries and sliced-away regions stay resident in the buffer as
+unreferenced bytes (`used_bytes()` shrinks; `buffer_bytes()` does not).
+**Compaction is an explicit, separate, user-level step**, orthogonal to the
+alterations themselves — rebuild through a fresh `*Builder` when, and only when,
+reclamation actually matters to you. Operations never compact behind your back,
+so their cost stays predictable.
+
 ## Storage strategy
 
 Storage starts `FixedLength` (a stride + count, no positions array) for the
@@ -29,8 +47,10 @@ different length triggers a one-time O(n) promotion to `Variable` (a
 `Vec<(u32, u32)>` of `(start, stop)` positions).
 
 `cut_start` / `cut_end` apply a global head/tail overlay in O(1) — no bytes
-move.  `drain` removes entries but leaves their bytes orphaned in the buffer;
-rebuild via a new pod if reclamation matters.
+move.  `max_len` truncates every entry index-only (O(1) on `FixedLength`, an
+O(n) position rewrite on `Variable`).  `drain` removes entries but leaves their
+bytes orphaned in the buffer.  None of these reclaim space — rebuild via a new
+pod if reclamation matters (see the guiding principle above).
 
 ## Example
 

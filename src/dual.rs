@@ -604,16 +604,18 @@ impl DualStringPod {
         *self = out;
     }
 
-    /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
-    /// pods; rebuilds both buffers for `Variable` pods.
+    /// Truncate every entry to at most `n` bytes. Index-only — no bytes are
+    /// copied and the buffers stay shared: O(1) for `FixedLength` (a uniform
+    /// tail cut), an O(len) position rewrite for `Variable`. Truncated tails
+    /// become unreferenced; reclaiming that space is a separate explicit step.
     ///
     /// If `conditional` is `Some`, only entries where the boolean is `true`
     /// are clipped; this promotes `FixedLength` → `Variable`.
     pub fn max_len(&mut self, n: usize, conditional: Option<&[bool]>) {
         let count = self.len();
         // Capture each entry's keep-window from its *current* length, before any
-        // mutation; "keep first min(len, n)". Recorded once at the end so the
-        // FixedLength fast path and the Variable rebuild log identically.
+        // mutation; "keep first min(len, n)". Recorded once at the end so every
+        // storage path logs the coordinate edit identically.
         let windows: Vec<Option<(usize, usize, usize)>> = (0..count)
             .map(|i| {
                 let affected = conditional.is_none_or(|c| c[i]);
@@ -622,41 +624,23 @@ impl DualStringPod {
             })
             .collect();
 
+        let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
         if let Some(cond) = conditional {
-            let n_u32 = u32::try_from(n).unwrap_or(u32::MAX);
             self.storage.truncate_bytes_conditional(n_u32, cond);
+        } else if let Storage::FixedLength { visible_len, .. } = self.storage {
+            // FixedLength + unconditional: every entry has the same length, so the
+            // truncation is a uniform O(1) tail cut. Buffers and per-column
+            // first-byte offsets stay shared and valid. The coordinate edit is
+            // logged via `record_windows` below, so don't double-record.
+            let vl = visible_len as usize;
+            if vl > n {
+                self.storage
+                    .cut_end(u32::try_from(vl - n).unwrap_or(u32::MAX), None);
+            }
         } else {
-            if let Storage::FixedLength { visible_len, .. } = self.storage {
-                let vl = visible_len as usize;
-                if vl > n {
-                    // storage-level cut: the coordinate edit is logged via
-                    // `record_windows` below, so don't double-record here.
-                    self.storage
-                        .cut_end(u32::try_from(vl - n).unwrap_or(u32::MAX), None);
-                }
-            }
-            let mut bld = DualStringPodBuilder::with_capacity(n, count);
-            let mut seq_buf = Vec::with_capacity(n);
-            let mut qual_buf = Vec::with_capacity(n);
-            for i in 0..count {
-                let s = self.seq(i);
-                let q = self.qual(i);
-                let len = s.len().min(n);
-                seq_buf.clear();
-                seq_buf.extend_from_slice(&s[..len]);
-                qual_buf.clear();
-                qual_buf.extend_from_slice(&q[..len]);
-                bld.push(&seq_buf, &qual_buf);
-            }
-            let temp = bld.finish();
-            self.seq = temp.seq;
-            self.qual = temp.qual;
-            self.storage = temp.storage;
-            // The rebuilt pod owns fresh, compact buffers whose entry 0 starts at
-            // each column's own first byte — adopt its offsets, or the stale ones
-            // from the pre-rebuild layout would index past the new buffers.
-            self.seq_first_byte = temp.seq_first_byte;
-            self.qual_first_byte = temp.qual_first_byte;
+            // Variable + unconditional: per-entry lengths differ, so narrow each
+            // entry to min(len, n) as an index-only overlay.
+            self.storage.truncate_bytes(n_u32);
         }
         self.record_windows(&windows);
         self.debug_assert_within_buffers();
@@ -1473,13 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn slice_dual_with_offset_then_max_len_rebuild() {
+    fn slice_dual_with_offset_then_max_len() {
         // Regression: the real demultiplex pipeline fuses seq+qual with a
         // non-zero per-column first-byte, slices a sub-range (combiner), then
-        // runs Truncate -> `max_len`, whose non-conditional path *rebuilds* into
-        // fresh compact buffers. The rebuild must adopt the new buffers' own
-        // first-byte offsets; keeping the stale (150-style) offset made later
-        // `seq`/`qual` reads index past the compact buffer.
+        // runs Truncate -> `max_len`. `max_len` is index-only, so the shared
+        // buffer and its non-zero first-byte offset must stay consistent (the
+        // original bug rebuilt and dropped the offset, indexing past the buffer).
         use crate::StringPodBuilder;
         let mut sb = StringPodBuilder::with_capacity(0, 5);
         let mut qb = StringPodBuilder::with_capacity(0, 5);
@@ -1495,13 +1478,15 @@ mod tests {
         qual.pop_front(1);
         let dual = DualStringPod::try_from_columns(seq, qual).unwrap();
         let mut s = dual.slice(1..3); // SEQ02, SEQ03
-        // Truncate to first 3 bytes — exercises the rebuild path.
-        s.max_len(3, None);
+        let buf_before = s.buffer_bytes();
+        s.max_len(3, None); // truncate to first 3 bytes
         assert_eq!(s.len(), 2);
         assert_eq!(s.seq(0), BStr::new("SEQ"));
         assert_eq!(s.qual(0), BStr::new("QAL"));
         assert_eq!(s.seq(1), BStr::new("SEQ"));
         assert_eq!(s.qual(1), BStr::new("QAL"));
+        // Index-only: no compaction, the underlying buffer is untouched.
+        assert_eq!(s.buffer_bytes(), buf_before);
     }
 
     #[test]

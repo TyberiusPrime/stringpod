@@ -122,6 +122,41 @@ fn max_len_drops_a_tag_beyond_the_cut() {
 }
 
 #[test]
+fn max_len_lifts_through_a_slice_with_offset() {
+    // Mirror the demultiplex pipeline that exposed the first-byte bug: a tag is
+    // born, the pod is sliced to a sub-range (a non-zero first byte / shifted
+    // rows), a splice makes the lengths uneven (so `max_len` takes the Variable
+    // index-only path), then Truncate -> `max_len` clips. The tag must still
+    // lift onto the right bytes across all of it.
+    let mut bld = DualStringPodBuilder::with_capacity(0, 3);
+    bld.push(b"AAAACCCCGG", b"IIIIIIIIII"); // row 0, len 10
+    bld.push(b"TTTTGGGGAA", b"FFFFFFFFFF"); // row 1, len 10
+    bld.push(b"CCCCAAAATT", b"JJJJJJJJJJ"); // row 2, len 10
+    let pod = bld.finish();
+
+    // Tag born on row 1: region [4, 8) ("GGGG"). Capture its generation now.
+    let born = pod.generation(1).expect("row 1 exists");
+
+    // Slice to rows 1..3 (row 1 -> sliced row 0). The edit history rides along.
+    let mut sliced = pod.slice(1..3);
+    assert_eq!(sliced.seq(0), BStr::new("TTTTGGGGAA"));
+
+    // Make the lengths uneven so `max_len` takes the rebuild path (not the
+    // FixedLength overlay), then clip to 8 bytes — past the [4, 8) tag's end.
+    sliced.splice_entries(&[Some((9, 1, b"X".to_vec(), b"K".to_vec())), None]);
+    sliced.max_len(8, None);
+
+    // The tag's bytes ("GGGG" at [4, 8)) are entirely within the kept prefix, so
+    // it lifts to the same offset and still names "GGGG".
+    match lift(&sliced, born, 0, 4, 4, 10) {
+        RegionLift::Kept { start, len } => {
+            assert_eq!(&sliced.seq(0)[start..start + len], BStr::new("GGGG"));
+        }
+        RegionLift::Dropped => panic!("expected Kept, got Dropped"),
+    }
+}
+
+#[test]
 fn write_back_splice_is_isolated_to_its_read() {
     let mut bld = DualStringPodBuilder::with_capacity(0, 2);
     bld.push(b"ACGTACGT", b"IIIIIIII"); // len 8

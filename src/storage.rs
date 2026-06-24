@@ -4,6 +4,16 @@ use std::ops::Range;
 /// Columnar storage layout. Crate-private; pods and builders own one of these
 /// and the corresponding byte buffer(s).
 ///
+/// **Index-only by default.** Every alteration that can be expressed by editing
+/// this metadata does so — it rewrites positions / overlays / counts and leaves
+/// the byte buffer shared and untouched. Bytes are cloned and written only when
+/// an operation changes byte *content* or *grows* an entry (the pod-level
+/// `prefix` / `postfix` / splice family). A consequence is that index-only
+/// edits never reclaim space: truncated, dropped and sliced-away bytes stay
+/// resident as unreferenced (`used_bytes` shrinks, the buffer length does not).
+/// Compaction is a deliberate, separate step (rebuild through a `*Builder`),
+/// never a side effect of an alteration.
+///
 /// Two independent overlays sit on top of the raw bytes/positions:
 ///
 /// * **Per-entry byte cuts** (`head_skip` / `tail_skip` / `visible_len`) shave
@@ -194,6 +204,18 @@ impl Storage {
                 }
             }
         }
+    }
+
+    /// Per-entry byte truncation to at most `len` bytes for *every* entry.
+    /// Index-only: narrows each entry's visible range in place, never touching or
+    /// reallocating the byte buffer. On `FixedLength` storage prefer the O(1)
+    /// `cut_end` overlay (every entry shares a length); this path promotes to
+    /// `Variable`, so it's the one to use once lengths already differ.
+    pub(crate) fn truncate_bytes(&mut self, len: u32) {
+        self.resize_positions(|_i, start, stop| {
+            let entry_len = stop - start;
+            Some((0, len.min(entry_len) as usize))
+        });
     }
 
     /// Per-entry byte truncation to at most `len` bytes for entries where

@@ -272,9 +272,10 @@ impl StringPod {
         out
     }
 
-    /// Truncate every entry to at most `n` bytes. O(1) for `FixedLength`
-    /// pods; rebuilds the buffer for `Variable` pods (entries may need to be
-    /// clipped by different amounts).
+    /// Truncate every entry to at most `n` bytes. Index-only — no bytes are
+    /// copied and the buffer stays shared: O(1) for `FixedLength` (a uniform
+    /// tail cut), an O(len) position rewrite for `Variable`. Truncated tails
+    /// become unreferenced; reclaiming that space is a separate explicit step.
     ///
     /// If `conditional` is `Some`, only entries where the boolean is `true`
     /// are clipped; this promotes `FixedLength` → `Variable`.
@@ -301,6 +302,9 @@ impl StringPod {
             }
             return self;
         }
+        // Variable + unconditional: narrow each entry to min(len, n) as an
+        // index-only overlay. No bytes move and the buffer stays shared;
+        // truncated tails become unreferenced (compaction is a separate step).
         let count = self.len();
         let windows: Vec<Option<(usize, usize, usize)>> = (0..count)
             .map(|i| {
@@ -308,15 +312,9 @@ impl StringPod {
                 (cur > n).then_some((0, n, cur))
             })
             .collect();
-        let mut bld = StringPodBuilder::with_capacity(n, count);
-        for i in 0..count {
-            let entry = self.get(i);
-            bld.push(&entry[..entry.len().min(n)]);
-        }
-        let mut out = bld.finish();
-        out.edits = self.edits;
-        out.record_windows(&windows);
-        out
+        self.storage.truncate_bytes(u32::try_from(n).unwrap_or(u32::MAX));
+        self.record_windows(&windows);
+        self
     }
 
     /// Generalized per-entry resize. For each entry `i` (in order), invokes
