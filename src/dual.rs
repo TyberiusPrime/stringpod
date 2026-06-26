@@ -43,6 +43,14 @@ impl std::fmt::Display for ColumnError {
 
 impl std::error::Error for ColumnError {}
 
+#[derive(Clone)]
+pub struct Splice {
+    pub at: usize,
+    pub del: usize,
+    pub seq: Vec<u8>,
+    pub qual: Vec<u8>,
+}
+
 /// Two parallel byte columns (e.g. sequence + quality) sharing a single
 /// metadata layout. The shared metadata makes the per-entry length invariant
 /// (`seq.len() == qual.len()` for every entry) structural rather than
@@ -564,7 +572,7 @@ impl DualStringPod {
         reason = "Yeah, it's a tuple. Could be improved"
     )]
     #[expect(clippy::needless_range_loop, reason = "i is used multiple times")]
-    pub fn splice_entries(&mut self, edits: &[Option<(usize, usize, Vec<u8>, Vec<u8>)>]) {
+    pub fn splice_entries(&mut self, edits: &[Option<Splice>]) {
         assert_eq!(
             edits.len(),
             self.len(),
@@ -579,7 +587,12 @@ impl DualStringPod {
         for i in 0..n {
             match &edits[i] {
                 None => bld.push(self.seq(i), self.qual(i)),
-                Some((at, del, ins_seq, ins_qual)) => {
+                Some(Splice {
+                    at,
+                    del,
+                    seq: ins_seq,
+                    qual: ins_qual,
+                }) => {
                     assert_eq!(
                         ins_seq.len(),
                         ins_qual.len(),
@@ -611,7 +624,13 @@ impl DualStringPod {
         // later liftover sees the length change.
         out.edits = std::mem::replace(&mut self.edits, ColumnEdits::new(0));
         for (i, e) in edits.iter().enumerate() {
-            if let Some((at, del, ins_seq, _)) = e {
+            if let Some(Splice {
+                at,
+                del,
+                seq: ins_seq,
+                ..
+            }) = e
+            {
                 out.record_splice(i, *at, *del, ins_seq.len());
             }
         }

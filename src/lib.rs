@@ -38,7 +38,7 @@ pub use cross::{
 };
 pub use dual::{
     ColumnError, DualEntry, DualEntryMut, DualIterMut, DualStringPod, DualStringPodAliasBuilder,
-    DualStringPodBuilder,
+    DualStringPodBuilder, Splice,
 };
 pub use editlog::{EditLog, EditLogError, EditLogView, OffsetLift, RegionLift};
 pub use lifted::Lifted;
