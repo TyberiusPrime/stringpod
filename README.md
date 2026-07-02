@@ -158,3 +158,13 @@ MIT
 
 Apache arrow BinaryArray. Covers packed buffers + offset array, even with fixed strides.
 Does not cover the DualStringPod case, nor the O(1) operations.
+
+
+
+## Changelog
+### 0.3.0
+- clarify that there is no compaction unless you request it / unless you 
+  make_mut()
+- max_len() is now COW.
+- introduce slicing on pods to get a subset of their contents.
+- en-bloc extension from other pods.

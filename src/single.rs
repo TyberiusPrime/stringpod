@@ -319,7 +319,8 @@ impl StringPod {
                 (cur > n).then_some((0, n, cur))
             })
             .collect();
-        self.storage.truncate_bytes(u32::try_from(n).unwrap_or(u32::MAX));
+        self.storage
+            .truncate_bytes(u32::try_from(n).unwrap_or(u32::MAX));
         self.record_windows(&windows);
         self
     }

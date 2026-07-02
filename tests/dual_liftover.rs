@@ -10,7 +10,7 @@
 //! single-read write-back.
 
 use bstr::BStr;
-use stringpod::{DualStringPod, DualStringPodBuilder, Lifted, RegionLift};
+use stringpod::{DualStringPod, DualStringPodBuilder, Lifted, RegionLift, Splice};
 
 fn lift(
     pod: &DualStringPod,
@@ -143,7 +143,15 @@ fn max_len_lifts_through_a_slice_with_offset() {
 
     // Make the lengths uneven so `max_len` takes the rebuild path (not the
     // FixedLength overlay), then clip to 8 bytes — past the [4, 8) tag's end.
-    sliced.splice_entries(&[Some((9, 1, b"X".to_vec(), b"K".to_vec())), None]);
+    sliced.splice_entries(&[
+        Some(Splice {
+            at: 9,
+            del: 1,
+            seq: b"X".to_vec(),
+            qual: b"K".to_vec(),
+        }),
+        None,
+    ]);
     sliced.max_len(8, None);
 
     // The tag's bytes ("GGGG" at [4, 8)) are entirely within the kept prefix, so
@@ -227,7 +235,15 @@ fn splice_entries_rewrites_bytes_and_carries_history() {
     );
 
     // Splice read 0 only: at current offset 0, replace 2 bytes ("CC") with 3 ("xyz").
-    pod.splice_entries(&[Some((0, 2, b"xyz".to_vec(), b"###".to_vec())), None]);
+    pod.splice_entries(&[
+        Some(Splice {
+            at: 0,
+            del: 2,
+            seq: b"xyz".to_vec(),
+            qual: b"###".to_vec(),
+        }),
+        None,
+    ]);
 
     // Bytes are rebuilt; read 1 is untouched.
     assert_eq!(pod.seq(0), BStr::new(b"xyzGGTT"));

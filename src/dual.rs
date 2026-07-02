@@ -567,10 +567,6 @@ impl DualStringPod {
     /// - If `edits.len() != self.len()`.
     /// - If any `ins_seq.len() != ins_qual.len()`.
     /// - If any `at + del` exceeds the entry's current length.
-    #[expect(
-        clippy::type_complexity,
-        reason = "Yeah, it's a tuple. Could be improved"
-    )]
     #[expect(clippy::needless_range_loop, reason = "i is used multiple times")]
     pub fn splice_entries(&mut self, edits: &[Option<Splice>]) {
         assert_eq!(
